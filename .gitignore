@@ -1,0 +1,25 @@
+# 编译生成的文件
+compiler
+*.exe
+*.o
+*.obj
+
+# CMake 生成的文件
+build/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+
+# 测试输出文件
+*.tokens
+
+# IDE 文件
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 系统文件
+.DS_Store
+Thumbs.db
