@@ -343,15 +343,20 @@ private:
         errorLines.insert(currentToken().line);
     }
 
-    // 同步：跳过token直到遇到下一个函数定义或文件结束
+    // 同步：跳过token直到遇到下一个可能的函数定义开始或文件结束
     void synchronizeToNextFunc() {
-        while (currentToken().type != "EOF") {
-            // 寻找下一个函数定义的开始
-            if ((check("'int'") || check("'void'")) &&
-                peekToken().type == "Ident" &&
-                peekToken(2).type == "'('") {
-                return;
-            }
+        // 跳过当前行剩余的token
+        while (!check("';'") && !check("'}'") &&
+               !check("'int'") && !check("'void'") &&
+               currentToken().type != "EOF") {
+            advance();
+        }
+        // 如果遇到分号，跳过它
+        if (check("';'")) {
+            advance();
+        }
+        // 如果遇到右大括号，跳过到下一个token
+        if (check("'}'")) {
             advance();
         }
     }
@@ -394,6 +399,7 @@ private:
     // FuncDef → ("int" | "void") ID "(" (Param ("," Param)*)? ")" Block
     bool parseFuncDef() {
         bool success = true;
+        int startLine = currentToken().line; // 记录函数定义开始的行号
 
         // 返回类型
         if (!match("'int'") && !match("'void'")) {
@@ -402,8 +408,22 @@ private:
         }
 
         // 函数名
-        if (!expect("Ident")) {
+        if (!check("Ident")) {
+            // 缺少函数名，使用开始行号
+            errorLines.insert(startLine);
+            hasError = true;
+            return false;
+        }
+        advance(); // 消耗Ident
+
+        // 检查是否是函数定义（有左括号）
+        if (!check("'('")) {
+            // 这不是函数定义，可能是全局变量声明
+            errorLines.insert(startLine); // 使用开始行号
+            hasError = true;
             success = false;
+            // 跳过到下一个函数定义
+            return false;
         }
 
         // 左括号
@@ -472,8 +492,16 @@ private:
                 // 不消耗这些token，让上层处理
                 break;
             }
-            // 继续解析语句，即使有错误
+
+            // 记录当前位置，防止死循环
+            int oldPos = current;
             parseStmt();
+
+            // 如果parseStmt没有前进，强制前进以避免死循环
+            if (current == oldPos) {
+                recordError();
+                advance();
+            }
         }
 
         if (!foundFuncDef) {
@@ -543,10 +571,12 @@ private:
 
         // 变量声明: int ID = Expr;
         if (match("'int'")) {
-            if (!expect("Ident")) return false;
-            if (!expect("'='")) return false;
+            bool success = true;
+            if (!expect("Ident")) success = false;
+            if (!expect("'='")) success = false;
             parseExpr();
-            return expect("';'");
+            if (!expect("';'")) success = false;
+            return success;
         }
 
         // 赋值或表达式语句: ID = Expr; 或 Expr;
@@ -564,9 +594,23 @@ private:
             }
         }
 
-        // 其他表达式语句
-        parseExpr();
-        return expect("';'");
+        // 其他表达式语句或错误
+        // 检查是否是表达式的开始
+        if (check("IntConst") || check("'('") || check("'+'") ||
+            check("'-'") || check("'!'")) {
+            parseExpr();
+            return expect("';'");
+        }
+
+        // 无法识别的语句，记录错误并跳过到下一个同步点
+        recordError();
+        // 跳过到分号或语句块结束
+        while (!check("';'") && !check("'}'") && !check("'{'") &&
+               currentToken().type != "EOF") {
+            advance();
+        }
+        if (check("';'")) advance(); // 消耗分号
+        return false;
     }
 
     // Expr → LOrExpr
