@@ -1,7 +1,7 @@
 CXX = g++
 CXXFLAGS = -std=c++11 -Wall
 TARGET = compiler
-SRC = lexer.cpp
+SRC = parser.cpp
 
 all: $(TARGET)
 

@@ -10,6 +10,7 @@ struct Token {
     int index;
     string type;
     string value;
+    int line;  // 添加行号信息
 };
 
 class Lexer {
@@ -19,6 +20,7 @@ private:
     int length;
     vector<Token> tokens;
     int tokenIndex;
+    int currentLine;  // 当前行号
 
     map<string, string> keywords;
 
@@ -50,6 +52,9 @@ private:
 
     void skipWhitespace() {
         while (position < length && isspace(currentChar())) {
+            if (currentChar() == '\n') {
+                currentLine++;
+            }
             advance();
         }
     }
@@ -65,6 +70,9 @@ private:
             advance();
             advance();
             while (position < length - 1) {
+                if (currentChar() == '\n') {
+                    currentLine++;
+                }
                 if (currentChar() == '*' && peekChar() == '/') {
                     advance();
                     advance();
@@ -98,11 +106,12 @@ private:
         token.index = tokenIndex++;
         token.type = type;
         token.value = value;
+        token.line = currentLine;
         tokens.push_back(token);
     }
 
 public:
-    Lexer(const string& src) : source(src), position(0), length(src.length()), tokenIndex(0) {
+    Lexer(const string& src) : source(src), position(0), length(src.length()), tokenIndex(0), currentLine(1) {
         initKeywords();
     }
 
