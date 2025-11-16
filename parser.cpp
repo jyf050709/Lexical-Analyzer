@@ -275,6 +275,17 @@ public:
             advance();
         }
 
+        // 在结束时扫描剩余的空白字符以正确更新行号
+        skipWhitespace();
+
+        // 添加EOF token，行号为当前行号
+        Token eofToken;
+        eofToken.index = tokenIndex;
+        eofToken.type = "EOF";
+        eofToken.value = "";
+        eofToken.line = currentLine;
+        tokens.push_back(eofToken);
+
         return tokens;
     }
 };
@@ -290,7 +301,8 @@ private:
     // 当前token
     Token& currentToken() {
         if (current >= tokens.size()) {
-            static Token eof = {-1, "EOF", "", tokens.empty() ? 1 : tokens.back().line};
+            // 应该不会到这里，因为词法分析器已经添加了EOF token
+            static Token eof = {-1, "EOF", "", 1};
             return eof;
         }
         return tokens[current];
@@ -300,7 +312,7 @@ private:
     Token& peekToken(int offset = 1) {
         int pos = current + offset;
         if (pos >= tokens.size()) {
-            static Token eof = {-1, "EOF", "", tokens.empty() ? 1 : tokens.back().line};
+            static Token eof = {-1, "EOF", "", 1};
             return eof;
         }
         return tokens[pos];
@@ -344,15 +356,33 @@ private:
         errorLines.insert(currentToken().line);
     }
 
-    // 同步：跳过token直到遇到下一个函数定义或文件结束
+    // 同步：跳过token直到遇到下一个可能的函数定义开始或文件结束
     void synchronizeToNextFunc() {
-        while (currentToken().type != "EOF") {
-            // 寻找下一个函数定义的开始
-            if ((check("'int'") || check("'void'")) &&
-                peekToken().type == "Ident" &&
-                peekToken(2).type == "'('") {
-                return;
+        // 跳过当前行剩余的token
+        while (!check("';'") && !check("'}'") && !check("'{'") &&
+               !check("'int'") && !check("'void'") &&
+               currentToken().type != "EOF") {
+            advance();
+        }
+        // 如果遇到分号，跳过它
+        if (check("';'")) {
+            advance();
+        }
+        // 如果遇到左大括号，跳过整个Block
+        if (check("'{'")) {
+            int braceCount = 1;
+            advance(); // 跳过 {
+            while (braceCount > 0 && currentToken().type != "EOF") {
+                if (check("'{'")) {
+                    braceCount++;
+                } else if (check("'}'")) {
+                    braceCount--;
+                }
+                advance();
             }
+        }
+        // 如果遇到右大括号，跳过到下一个token
+        if (check("'}'")) {
             advance();
         }
     }
@@ -550,12 +580,20 @@ private:
             return success;
         }
 
-        // 变量声明: int ID = Expr;
+        // 变量声明: int ID = Expr (; | , ID = Expr)*
         if (match("'int'")) {
             bool success = true;
             if (!expect("Ident")) success = false;
             if (!expect("'='")) success = false;
             parseExpr();
+
+            // 支持逗号分隔的多个变量声明
+            while (match("','")) {
+                if (!expect("Ident")) success = false;
+                if (!expect("'='")) success = false;
+                parseExpr();
+            }
+
             if (!expect("';'")) success = false;
             return success;
         }
