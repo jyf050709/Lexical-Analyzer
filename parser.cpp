@@ -1,3 +1,4 @@
+
 #include <iostream>
 #include <string>
 #include <vector>
@@ -274,17 +275,6 @@ public:
             advance();
         }
 
-        // 在结束时扫描剩余的空白字符以正确更新行号
-        skipWhitespace();
-
-        // 添加EOF token，行号为当前行号
-        Token eofToken;
-        eofToken.index = tokenIndex;
-        eofToken.type = "EOF";
-        eofToken.value = "";
-        eofToken.line = currentLine;
-        tokens.push_back(eofToken);
-
         return tokens;
     }
 };
@@ -300,9 +290,7 @@ private:
     // 当前token
     Token& currentToken() {
         if (current >= tokens.size()) {
-            // 应该不会到这里，因为词法分析器已经添加了EOF token
-            // 但为了安全起见，返回一个默认的EOF
-            static Token eof = {-1, "EOF", "", 1};
+            static Token eof = {-1, "EOF", "", tokens.empty() ? 1 : tokens.back().line};
             return eof;
         }
         return tokens[current];
@@ -312,8 +300,7 @@ private:
     Token& peekToken(int offset = 1) {
         int pos = current + offset;
         if (pos >= tokens.size()) {
-            // 返回默认EOF
-            static Token eof = {-1, "EOF", "", 1};
+            static Token eof = {-1, "EOF", "", tokens.empty() ? 1 : tokens.back().line};
             return eof;
         }
         return tokens[pos];
@@ -357,33 +344,15 @@ private:
         errorLines.insert(currentToken().line);
     }
 
-    // 同步：跳过token直到遇到下一个可能的函数定义开始或文件结束
+    // 同步：跳过token直到遇到下一个函数定义或文件结束
     void synchronizeToNextFunc() {
-        // 跳过当前行剩余的token
-        while (!check("';'") && !check("'}'") && !check("'{'") &&
-               !check("'int'") && !check("'void'") &&
-               currentToken().type != "EOF") {
-            advance();
-        }
-        // 如果遇到分号，跳过它
-        if (check("';'")) {
-            advance();
-        }
-        // 如果遇到左大括号，跳过整个Block
-        if (check("'{'")) {
-            int braceCount = 1;
-            advance(); // 跳过 {
-            while (braceCount > 0 && currentToken().type != "EOF") {
-                if (check("'{'")) {
-                    braceCount++;
-                } else if (check("'}'")) {
-                    braceCount--;
-                }
-                advance();
+        while (currentToken().type != "EOF") {
+            // 寻找下一个函数定义的开始
+            if ((check("'int'") || check("'void'")) &&
+                peekToken().type == "Ident" &&
+                peekToken(2).type == "'('") {
+                return;
             }
-        }
-        // 如果遇到右大括号，跳过到下一个token
-        if (check("'}'")) {
             advance();
         }
     }
@@ -426,7 +395,6 @@ private:
     // FuncDef → ("int" | "void") ID "(" (Param ("," Param)*)? ")" Block
     bool parseFuncDef() {
         bool success = true;
-        int startLine = currentToken().line; // 记录函数定义开始的行号
 
         // 返回类型
         if (!match("'int'") && !match("'void'")) {
@@ -435,22 +403,8 @@ private:
         }
 
         // 函数名
-        if (!check("Ident")) {
-            // 缺少函数名，使用开始行号
-            errorLines.insert(startLine);
-            hasError = true;
-            return false;
-        }
-        advance(); // 消耗Ident
-
-        // 检查是否是函数定义（有左括号）
-        if (!check("'('")) {
-            // 这不是函数定义，可能是全局变量声明
-            errorLines.insert(startLine); // 使用开始行号
-            hasError = true;
+        if (!expect("Ident")) {
             success = false;
-            // 跳过到下一个函数定义
-            return false;
         }
 
         // 左括号
@@ -596,20 +550,12 @@ private:
             return success;
         }
 
-        // 变量声明: int ID = Expr (; | , ID = Expr)*
+        // 变量声明: int ID = Expr;
         if (match("'int'")) {
             bool success = true;
             if (!expect("Ident")) success = false;
             if (!expect("'='")) success = false;
             parseExpr();
-
-            // 支持逗号分隔的多个变量声明
-            while (match("','")) {
-                if (!expect("Ident")) success = false;
-                if (!expect("'='")) success = false;
-                parseExpr();
-            }
-
             if (!expect("';'")) success = false;
             return success;
         }
