@@ -200,6 +200,13 @@ struct AssignStmt : Stmt {
     AssignStmt(const string& n, unique_ptr<Expr> v) : name(n), value(move(v)) {}
 };
 
+// 赋值表达式 (支持链式赋值如 a = b = c)
+struct AssignExpr : Expr {
+    string name;
+    unique_ptr<Expr> value;
+    AssignExpr(const string& n, unique_ptr<Expr> v) : name(n), value(move(v)) {}
+};
+
 struct IfStmt : Stmt {
     unique_ptr<Expr> cond;
     unique_ptr<Stmt> thenStmt;
@@ -373,7 +380,25 @@ private:
         return make_unique<ExprStmt>(move(expr));
     }
 
-    unique_ptr<Expr> parseExpr() { return parseLOr(); }
+    unique_ptr<Expr> parseExpr() { return parseAssign(); }
+
+    // 赋值表达式 (右结合)
+    unique_ptr<Expr> parseAssign() {
+        // 保存当前位置以便回溯
+        size_t savedPos = current;
+
+        if (check(TokenType::IDENT)) {
+            string name = tokens[current].value;
+            current++;
+            if (match(TokenType::ASSIGN)) {
+                auto value = parseAssign();  // 右结合
+                return make_unique<AssignExpr>(name, move(value));
+            }
+            // 不是赋值，回溯
+            current = savedPos;
+        }
+        return parseLOr();
+    }
 
     unique_ptr<Expr> parseLOr() {
         auto left = parseLAnd();
@@ -635,6 +660,24 @@ private:
                 emit("addi sp, sp, " + to_string(stackArgs * 4));
             }
             emit("mv t0, a0");
+            return;
+        }
+
+        // 赋值表达式 (结果是赋值后的值)
+        if (auto* assignExpr = dynamic_cast<AssignExpr*>(expr)) {
+            genExpr(assignExpr->value.get());
+            int paramIdx;
+            int offset = lookupVar(assignExpr->name, paramIdx);
+            if (paramIdx >= 0) {
+                if (paramIdx < 8) {
+                    emit("sw t0, " + to_string(-12 - paramIdx * 4) + "(s0)");
+                } else {
+                    emit("sw t0, " + to_string((paramIdx - 8) * 4) + "(s0)");
+                }
+            } else {
+                emit("sw t0, " + to_string(offset) + "(s0)");
+            }
+            // t0 仍然保存赋值的值，可以用于链式赋值
             return;
         }
     }
