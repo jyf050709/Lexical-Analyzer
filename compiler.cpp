@@ -18,12 +18,6 @@ enum class TokenType {
     PLUS_ASSIGN, MINUS_ASSIGN, STAR_ASSIGN, SLASH_ASSIGN, MOD_ASSIGN,
     LT, GT, LE, GE, EQ, NE,
     AND, OR, NOT, ASSIGN,
-    // 位运算符
-    BIT_AND, BIT_OR, BIT_XOR, BIT_NOT,
-    // 移位运算符
-    SHL, SHR,
-    // 三元运算符
-    QUESTION, COLON,
     LPAREN, RPAREN, LBRACE, RBRACE, SEMICOLON, COMMA,
     END_OF_FILE
 };
@@ -130,8 +124,6 @@ public:
             if (ch == '!' && peek(1) == '=') { addToken(TokenType::NE, "!="); advance(); advance(); continue; }
             if (ch == '&' && peek(1) == '&') { addToken(TokenType::AND, "&&"); advance(); advance(); continue; }
             if (ch == '|' && peek(1) == '|') { addToken(TokenType::OR, "||"); advance(); advance(); continue; }
-            if (ch == '<' && peek(1) == '<') { addToken(TokenType::SHL, "<<"); advance(); advance(); continue; }
-            if (ch == '>' && peek(1) == '>') { addToken(TokenType::SHR, ">>"); advance(); advance(); continue; }
 
             switch (ch) {
                 case '+': addToken(TokenType::PLUS, "+"); break;
@@ -143,12 +135,6 @@ public:
                 case '>': addToken(TokenType::GT, ">"); break;
                 case '=': addToken(TokenType::ASSIGN, "="); break;
                 case '!': addToken(TokenType::NOT, "!"); break;
-                case '&': addToken(TokenType::BIT_AND, "&"); break;
-                case '|': addToken(TokenType::BIT_OR, "|"); break;
-                case '^': addToken(TokenType::BIT_XOR, "^"); break;
-                case '~': addToken(TokenType::BIT_NOT, "~"); break;
-                case '?': addToken(TokenType::QUESTION, "?"); break;
-                case ':': addToken(TokenType::COLON, ":"); break;
                 case '(': addToken(TokenType::LPAREN, "("); break;
                 case ')': addToken(TokenType::RPAREN, ")"); break;
                 case '{': addToken(TokenType::LBRACE, "{"); break;
@@ -443,9 +429,25 @@ private:
         if (check(TokenType::IDENT)) {
             string name = tokens[current].value;
             current++;
+
+            // assignment operators (right-associative)
             if (match(TokenType::ASSIGN)) {
                 auto value = parseAssign();  // 右结合
                 return make_unique<AssignExpr>(name, move(value));
+            }
+
+            string op;
+            if (match(TokenType::PLUS_ASSIGN)) op = "+";
+            else if (match(TokenType::MINUS_ASSIGN)) op = "-";
+            else if (match(TokenType::STAR_ASSIGN)) op = "*";
+            else if (match(TokenType::SLASH_ASSIGN)) op = "/";
+            else if (match(TokenType::MOD_ASSIGN)) op = "%";
+
+            if (!op.empty()) {
+                auto rhs = parseAssign();
+                auto left = make_unique<IdentExpr>(name);
+                auto binExpr = make_unique<BinaryExpr>(op, move(left), move(rhs));
+                return make_unique<AssignExpr>(name, move(binExpr));
             }
             // 不是赋值，回溯
             current = savedPos;
