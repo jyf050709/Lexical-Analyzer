@@ -194,6 +194,12 @@ struct VarDeclStmt : Stmt {
     VarDeclStmt(const string& n, unique_ptr<Expr> i) : name(n), init(move(i)) {}
 };
 
+struct GlobalVar : ASTNode {
+    string name;
+    unique_ptr<Expr> init;
+    GlobalVar(const string& n, unique_ptr<Expr> i) : name(n), init(move(i)) {}
+};
+
 struct AssignStmt : Stmt {
     string name;
     unique_ptr<Expr> value;
@@ -251,6 +257,7 @@ struct FuncDef : ASTNode {
 };
 
 struct Program : ASTNode {
+    vector<unique_ptr<GlobalVar>> globals;
     vector<unique_ptr<FuncDef>> functions;
 };
 
@@ -269,7 +276,39 @@ private:
 
     unique_ptr<Program> parseProgram() {
         auto prog = make_unique<Program>();
-        while (!isAtEnd()) prog->functions.push_back(parseFuncDef());
+        while (!isAtEnd()) {
+            if (check(TokenType::VOID)) {
+                prog->functions.push_back(parseFuncDef());
+                continue;
+            }
+
+            if (check(TokenType::INT)) {
+                // Lookahead: "int id(" => function, otherwise global variable declaration.
+                size_t savedPos = current;
+                consume(TokenType::INT);
+                Token nameTok = consume(TokenType::IDENT);
+                if (check(TokenType::LPAREN)) {
+                    current = savedPos;
+                    prog->functions.push_back(parseFuncDef());
+                    continue;
+                }
+
+                // Global variable(s): int a = 1, b;
+                auto addGlobal = [&](Token identTok) {
+                    unique_ptr<Expr> init = nullptr;
+                    if (match(TokenType::ASSIGN)) init = parseExpr();
+                    else init = make_unique<NumberExpr>(0);
+                    prog->globals.push_back(make_unique<GlobalVar>(identTok.value, move(init)));
+                };
+
+                addGlobal(nameTok);
+                while (match(TokenType::COMMA)) addGlobal(consume(TokenType::IDENT));
+                consume(TokenType::SEMICOLON);
+                continue;
+            }
+
+            throw runtime_error("Expected top-level declaration");
+        }
         return prog;
     }
 
@@ -498,6 +537,9 @@ private:
     vector<string> breakLabels;
     vector<string> continueLabels;
 
+    set<string> globalVars;
+    map<string, int> globalInitValues;
+
     // 变量名 -> 栈偏移（相对于s0的负偏移）
     vector<map<string, int>> varScopes;
     // 参数名 -> 参数索引
@@ -507,6 +549,58 @@ private:
 
     void emit(const string& s) { out << "\t" << s << "\n"; }
     void emitLabel(const string& s) { out << s << ":\n"; }
+
+    int evalConstExpr(Expr* expr) {
+        if (auto* num = dynamic_cast<NumberExpr*>(expr)) return num->value;
+
+        if (auto* unary = dynamic_cast<UnaryExpr*>(expr)) {
+            int operand = evalConstExpr(unary->operand.get());
+            if (unary->op == "+") return operand;
+            if (unary->op == "-") return -operand;
+            if (unary->op == "!") return operand == 0 ? 1 : 0;
+            throw runtime_error("Unsupported unary operator in global initializer");
+        }
+
+        if (auto* binary = dynamic_cast<BinaryExpr*>(expr)) {
+            if (binary->op == "&&") {
+                int left = evalConstExpr(binary->left.get());
+                if (left == 0) return 0;
+                int right = evalConstExpr(binary->right.get());
+                return right != 0 ? 1 : 0;
+            }
+
+            if (binary->op == "||") {
+                int left = evalConstExpr(binary->left.get());
+                if (left != 0) return 1;
+                int right = evalConstExpr(binary->right.get());
+                return right != 0 ? 1 : 0;
+            }
+
+            int left = evalConstExpr(binary->left.get());
+            int right = evalConstExpr(binary->right.get());
+
+            if (binary->op == "+") return left + right;
+            if (binary->op == "-") return left - right;
+            if (binary->op == "*") return left * right;
+            if (binary->op == "/") {
+                if (right == 0) throw runtime_error("Division by zero in global initializer");
+                return left / right;
+            }
+            if (binary->op == "%") {
+                if (right == 0) throw runtime_error("Modulo by zero in global initializer");
+                return left % right;
+            }
+            if (binary->op == "<") return left < right ? 1 : 0;
+            if (binary->op == ">") return left > right ? 1 : 0;
+            if (binary->op == "<=") return left <= right ? 1 : 0;
+            if (binary->op == ">=") return left >= right ? 1 : 0;
+            if (binary->op == "==") return left == right ? 1 : 0;
+            if (binary->op == "!=") return left != right ? 1 : 0;
+            throw runtime_error("Unsupported binary operator in global initializer");
+        }
+
+        throw runtime_error("Non-constant global initializer");
+    }
 
     // 分配栈空间给变量，返回偏移
     int allocVar(const string& name) {
@@ -529,6 +623,11 @@ private:
             paramIdx = paramIndex[name];
             return 0;  // 参数存在特定位置
         }
+        // 查找全局变量
+        if (globalVars.count(name)) {
+            paramIdx = -2;
+            return 0;
+        }
         throw runtime_error("Undefined variable: " + name);
     }
 
@@ -542,7 +641,10 @@ private:
         if (auto* ident = dynamic_cast<IdentExpr*>(expr)) {
             int paramIdx;
             int offset = lookupVar(ident->name, paramIdx);
-            if (paramIdx >= 0) {
+            if (paramIdx == -2) {
+                emit("la t1, " + ident->name);
+                emit("lw t0, 0(t1)");
+            } else if (paramIdx >= 0) {
                 if (paramIdx < 8) {
                     // 参数 0-7 从帧中加载（保存自 a0-a7）
                     emit("lw t0, " + to_string(-12 - paramIdx * 4) + "(s0)");
@@ -668,7 +770,10 @@ private:
             genExpr(assignExpr->value.get());
             int paramIdx;
             int offset = lookupVar(assignExpr->name, paramIdx);
-            if (paramIdx >= 0) {
+            if (paramIdx == -2) {
+                emit("la t1, " + assignExpr->name);
+                emit("sw t0, 0(t1)");
+            } else if (paramIdx >= 0) {
                 if (paramIdx < 8) {
                     emit("sw t0, " + to_string(-12 - paramIdx * 4) + "(s0)");
                 } else {
@@ -709,7 +814,10 @@ private:
             genExpr(assign->value.get());
             int paramIdx;
             int offset = lookupVar(assign->name, paramIdx);
-            if (paramIdx >= 0) {
+            if (paramIdx == -2) {
+                emit("la t1, " + assign->name);
+                emit("sw t0, 0(t1)");
+            } else if (paramIdx >= 0) {
                 if (paramIdx < 8) {
                     emit("sw t0, " + to_string(-12 - paramIdx * 4) + "(s0)");
                 } else {
@@ -855,6 +963,25 @@ private:
 
 public:
     string generate(Program* prog) {
+        globalVars.clear();
+        globalInitValues.clear();
+
+        if (!prog->globals.empty()) {
+            out << ".data\n";
+            for (auto& global : prog->globals) {
+                if (globalVars.count(global->name)) throw runtime_error("Duplicate global variable: " + global->name);
+                globalVars.insert(global->name);
+
+                int initValue = evalConstExpr(global->init.get());
+                globalInitValues[global->name] = initValue;
+
+                out << ".globl " << global->name << "\n";
+                emitLabel(global->name);
+                out << "\t.word " << initValue << "\n";
+            }
+            out << "\n";
+        }
+
         out << ".text\n\n";
         for (auto& func : prog->functions) {
             genFunc(func.get());
