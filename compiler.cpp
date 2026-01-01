@@ -598,33 +598,39 @@ private:
         }
 
         if (auto* call = dynamic_cast<CallExpr*>(expr)) {
-            // 保存参数到临时栈空间
             int argCount = call->args.size();
             int stackArgs = (argCount > 8) ? (argCount - 8) : 0;
+
             if (argCount > 0) {
-                emit("addi sp, sp, -" + to_string(argCount * 4));
+                // 分配临时空间 + 栈上参数空间
+                int tempSpace = argCount * 4;
+                int stackArgsSpace = stackArgs * 4;
+                emit("addi sp, sp, -" + to_string(tempSpace + stackArgsSpace));
+
+                // 计算并保存所有参数到临时空间
                 for (int i = 0; i < argCount; i++) {
                     genExpr(call->args[i].get());
-                    emit("sw t0, " + to_string(i * 4) + "(sp)");
+                    emit("sw t0, " + to_string(stackArgsSpace + i * 4) + "(sp)");
                 }
+
                 // 加载前8个到参数寄存器
                 for (int i = 0; i < argCount && i < 8; i++) {
-                    emit("lw a" + to_string(i) + ", " + to_string(i * 4) + "(sp)");
+                    emit("lw a" + to_string(i) + ", " + to_string(stackArgsSpace + i * 4) + "(sp)");
                 }
-                // 超过8个的参数保留在栈上，只恢复前8个的空间
-                if (argCount > 8) {
-                    // 把超过8个的参数移到栈顶
-                    for (int i = 8; i < argCount; i++) {
-                        emit("lw t0, " + to_string(i * 4) + "(sp)");
-                        emit("sw t0, " + to_string((i - 8) * 4) + "(sp)");
-                    }
-                    emit("addi sp, sp, " + to_string(8 * 4));
-                } else {
-                    emit("addi sp, sp, " + to_string(argCount * 4));
+
+                // 把超过8个的参数复制到栈参数区（sp 附近）
+                for (int i = 8; i < argCount; i++) {
+                    emit("lw t0, " + to_string(stackArgsSpace + i * 4) + "(sp)");
+                    emit("sw t0, " + to_string((i - 8) * 4) + "(sp)");
                 }
+
+                // 释放临时空间，保留栈参数空间
+                emit("addi sp, sp, " + to_string(tempSpace));
             }
+
             emit("call " + call->funcName);
-            // 恢复超过8个参数占用的栈空间
+
+            // 释放栈上参数空间
             if (stackArgs > 0) {
                 emit("addi sp, sp, " + to_string(stackArgs * 4));
             }
