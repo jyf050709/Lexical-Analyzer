@@ -518,8 +518,13 @@ private:
             int paramIdx;
             int offset = lookupVar(ident->name, paramIdx);
             if (paramIdx >= 0) {
-                // 从参数存储位置加载
-                emit("lw t0, " + to_string(-12 - paramIdx * 4) + "(s0)");
+                if (paramIdx < 8) {
+                    // 参数 0-7 从帧中加载（保存自 a0-a7）
+                    emit("lw t0, " + to_string(-12 - paramIdx * 4) + "(s0)");
+                } else {
+                    // 参数 8+ 从调用者栈上加载
+                    emit("lw t0, " + to_string((paramIdx - 8) * 4) + "(s0)");
+                }
             } else {
                 emit("lw t0, " + to_string(offset) + "(s0)");
             }
@@ -595,19 +600,34 @@ private:
         if (auto* call = dynamic_cast<CallExpr*>(expr)) {
             // 保存参数到临时栈空间
             int argCount = call->args.size();
+            int stackArgs = (argCount > 8) ? (argCount - 8) : 0;
             if (argCount > 0) {
                 emit("addi sp, sp, -" + to_string(argCount * 4));
                 for (int i = 0; i < argCount; i++) {
                     genExpr(call->args[i].get());
                     emit("sw t0, " + to_string(i * 4) + "(sp)");
                 }
-                // 加载到参数寄存器
+                // 加载前8个到参数寄存器
                 for (int i = 0; i < argCount && i < 8; i++) {
                     emit("lw a" + to_string(i) + ", " + to_string(i * 4) + "(sp)");
                 }
-                emit("addi sp, sp, " + to_string(argCount * 4));
+                // 超过8个的参数保留在栈上，只恢复前8个的空间
+                if (argCount > 8) {
+                    // 把超过8个的参数移到栈顶
+                    for (int i = 8; i < argCount; i++) {
+                        emit("lw t0, " + to_string(i * 4) + "(sp)");
+                        emit("sw t0, " + to_string((i - 8) * 4) + "(sp)");
+                    }
+                    emit("addi sp, sp, " + to_string(8 * 4));
+                } else {
+                    emit("addi sp, sp, " + to_string(argCount * 4));
+                }
             }
             emit("call " + call->funcName);
+            // 恢复超过8个参数占用的栈空间
+            if (stackArgs > 0) {
+                emit("addi sp, sp, " + to_string(stackArgs * 4));
+            }
             emit("mv t0, a0");
             return;
         }
@@ -641,7 +661,11 @@ private:
             int paramIdx;
             int offset = lookupVar(assign->name, paramIdx);
             if (paramIdx >= 0) {
-                emit("sw t0, " + to_string(-12 - paramIdx * 4) + "(s0)");
+                if (paramIdx < 8) {
+                    emit("sw t0, " + to_string(-12 - paramIdx * 4) + "(s0)");
+                } else {
+                    emit("sw t0, " + to_string((paramIdx - 8) * 4) + "(s0)");
+                }
             } else {
                 emit("sw t0, " + to_string(offset) + "(s0)");
             }
