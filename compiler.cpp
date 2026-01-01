@@ -340,7 +340,7 @@ private:
             }
             return stmtList;
         }
-        if (check(TokenType::IDENT) && tokens[current + 1].type == TokenType::ASSIGN) {
+        if (check(TokenType::IDENT) && current + 1 < tokens.size() && tokens[current + 1].type == TokenType::ASSIGN) {
             string name = consume(TokenType::IDENT).value;
             consume(TokenType::ASSIGN);
             auto val = parseExpr();
@@ -348,7 +348,7 @@ private:
             return make_unique<AssignStmt>(name, move(val));
         }
         // 复合赋值: x += expr 等价于 x = x + expr
-        if (check(TokenType::IDENT)) {
+        if (check(TokenType::IDENT) && current + 1 < tokens.size()) {
             TokenType nextType = tokens[current + 1].type;
             string op;
             if (nextType == TokenType::PLUS_ASSIGN) op = "+";
