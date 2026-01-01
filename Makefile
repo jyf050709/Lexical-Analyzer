@@ -1,14 +1,13 @@
 CXX = g++
-CXXFLAGS = -std=c++11 -Wall
+CXXFLAGS = -std=c++17 -Wall -O2
 TARGET = compiler
-SRC = parser.cpp
 
 all: $(TARGET)
 
-$(TARGET): $(SRC)
-	$(CXX) $(CXXFLAGS) -o $(TARGET) $(SRC)
+$(TARGET): compiler.cpp
+	$(CXX) $(CXXFLAGS) -o $(TARGET) compiler.cpp
 
 clean:
-	rm -f $(TARGET)
+	rm -f $(TARGET) *.exe
 
 .PHONY: all clean

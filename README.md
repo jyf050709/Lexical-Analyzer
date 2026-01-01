@@ -1,35 +1,43 @@
-# ToyC 语法分析器
+# ToyC 编译器
 
-这是一个手写的 ToyC 语言语法分析器，用于检查 ToyC 源代码的语法正确性。
+一个完整的 ToyC 语言编译器，能够将 ToyC 源代码编译为 RISC-V32 汇编代码。
 
 ## 功能特性
 
 ### 词法分析
-- 识别所有 ToyC 关键字：int, void, if, else, while, break, continue, return
-- 识别运算符：+, -, *, /, %, <, >, <=, >=, ==, !=, &&, ||, !, =
-- 识别分隔符：(, ), {, }, ;, ,
-- 识别标识符（符合 C 语言规范）
-- 识别整数常量
-- 正确处理单行注释 (//) 和多行注释 (/* */)
-- 忽略空白字符
-- 跟踪行号信息
+- 识别所有 ToyC 关键字：`int`, `void`, `if`, `else`, `while`, `break`, `continue`, `return`
+- 识别运算符：`+`, `-`, `*`, `/`, `%`, `<`, `>`, `<=`, `>=`, `==`, `!=`, `&&`, `||`, `!`, `=`
+- 识别分隔符：`(`, `)`, `{`, `}`, `;`, `,`
+- 识别标识符和整数常量
+- 正确处理单行注释 (`//`) 和多行注释 (`/* */`)
 
 ### 语法分析
-- 使用递归下降分析法实现
+- 递归下降解析器
+- 构建抽象语法树 (AST)
 - 支持完整的 ToyC 文法
-- 错误恢复机制，可以检测并报告多个语法错误
-- 自动去重和排序错误行号
+
+### 代码生成
+- 生成 RISC-V32 汇编代码
+- 支持函数调用约定
+- 栈式存储管理
+- 短路求值 (`&&`, `||`)
+
+## 支持的语法
+
+- 函数定义和调用（支持递归）
+- 变量声明和赋值
+- 算术运算：`+` `-` `*` `/` `%`
+- 关系运算：`<` `>` `<=` `>=` `==` `!=`
+- 逻辑运算：`&&` `||` `!`（短路求值）
+- 一元运算：`+` `-` `!`
+- if-else 条件语句
+- while 循环
+- break / continue
+- return 语句
 
 ## 构建方法
 
-### 使用 CMake (推荐)
-
-```bash
-cmake -B build
-cmake --build build
-```
-
-### 使用 Makefile
+### 使用 Make
 
 ```bash
 make
@@ -38,7 +46,7 @@ make
 ### 直接编译
 
 ```bash
-g++ -o compiler parser.cpp -std=c++11
+g++ -std=c++17 -o compiler compiler.cpp
 ```
 
 ## 使用方法
@@ -46,7 +54,7 @@ g++ -o compiler parser.cpp -std=c++11
 ### 从标准输入读取
 
 ```bash
-echo "int a = 1;" | ./compiler
+echo "int main() { return 42; }" | ./compiler
 ```
 
 ### 从文件读取
@@ -58,80 +66,74 @@ echo "int a = 1;" | ./compiler
 ### 输出到文件
 
 ```bash
-./compiler < test.c > output.tokens
-```
-
-## 输出格式
-
-### 语法正确时
-输出一行：
-```
-accept
-```
-
-### 语法错误时
-第一行输出：
-```
-reject
-```
-后续行列出所有错误的行号（按升序排列，自动去重）：
-```
-reject
-1
-6
-10
+./compiler < test.c > output.s
 ```
 
 ## 示例
 
-### 正确的 ToyC 程序
+### 输入
 ```c
 int main() {
-    int result = 0;
-    return result;
+    return 1;
 }
 ```
-输出：
-```
-accept
+
+### 输出
+```asm
+.text
+
+.globl main
+main:
+prologue_main:
+    addi sp, sp, -144
+    sw ra, 140(sp)
+    sw s0, 136(sp)
+    addi s0, sp, 144
+    li t0, 1
+    mv a0, t0
+    lw ra, 140(sp)
+    lw s0, 136(sp)
+    addi sp, sp, 144
+    ret
 ```
 
-### 有语法错误的程序
+### 更多示例
+
+#### 函数调用
 ```c
-int f(int x, int y {  // 缺少 )
-    return x;
+int add(int a, int b) {
+    return a + b;
+}
+int main() {
+    return add(3, 5);
 }
 ```
-输出：
+
+#### 循环
+```c
+int main() {
+    int sum = 0;
+    int i = 1;
+    while (i <= 10) {
+        sum = sum + i;
+        i = i + 1;
+    }
+    return sum;
+}
 ```
-reject
-1
+
+#### 递归
+```c
+int fib(int n) {
+    if (n <= 1) { return n; }
+    return fib(n - 1) + fib(n - 2);
+}
+int main() {
+    return fib(10);
+}
 ```
 
-## 实现说明
-
-### 词法分析器 (Lexer)
-- 完全手写实现，未使用任何自动生成工具（如 Flex/Lex）
-- 采用状态机方法逐字符扫描源代码
-- 根据字符特征识别不同类型的 token
-- 在扫描过程中跟踪当前行号
-
-### 语法分析器 (Parser)
-- 完全手写实现，未使用任何自动生成工具（如 Yacc/Bison）
-- 采用递归下降分析法
-- 每个文法产生式对应一个解析函数
-- 通过 LL(1) 预测分析选择正确的产生式
-- 实现了左递归消除（将左递归改写为迭代）
-
-### 错误恢复机制
-- 遇到语法错误时记录错误行号
-- 使用恐慌模式 (Panic Mode) 进行错误恢复
-- 跳过token直到找到合适的同步点
-- 同步点包括：分号、大括号、关键字等
-- 能够在一次扫描中检测多个语法错误
-- 自动去重和排序错误行号
-
-## 支持的 ToyC 文法
+## ToyC 文法
 
 ```
 CompUnit → FuncDef+
@@ -155,9 +157,8 @@ PrimaryExpr → ID | NUMBER | "(" Expr ")" | ID "(" (Expr ("," Expr)*)? ")"
 
 ## 文件结构
 
-- `parser.cpp` - 语法分析器主文件（包含词法分析器和语法分析器）
-- `lexer.cpp` - 独立的词法分析器（用于词法分析作业）
-- `CMakeLists.txt` - CMake 构建配置
-- `Makefile` - Make 构建配置
-- `test*.c` - 测试用例文件
+- `compiler.cpp` - 完整的 ToyC 编译器实现
+- `ToyC编译器实现方案.md` - 详细的实现方案文档
+- `作业要求` - 作业要求说明
+- `Makefile` - 构建配置
 - `README.md` - 本文档
