@@ -220,6 +220,11 @@ struct ExprStmt : Stmt {
 
 struct EmptyStmt : Stmt {};
 
+// 语句列表（不创建新作用域，用于多变量声明）
+struct StmtList : Stmt {
+    vector<unique_ptr<Stmt>> stmts;
+};
+
 struct Param : ASTNode {
     string name;
     Param(const string& n) : name(n) {}
@@ -309,11 +314,25 @@ private:
             return stmt;
         }
         if (match(TokenType::INT)) {
-            string name = consume(TokenType::IDENT).value;
-            consume(TokenType::ASSIGN);
-            auto init = parseExpr();
+            // 支持 int x; 或 int x = expr; 或 int x, y, z;
+            auto stmtList = make_unique<StmtList>();
+            do {
+                string name = consume(TokenType::IDENT).value;
+                unique_ptr<Expr> init = nullptr;
+                if (match(TokenType::ASSIGN)) {
+                    init = parseExpr();
+                } else {
+                    // 默认初始化为0
+                    init = make_unique<NumberExpr>(0);
+                }
+                stmtList->stmts.push_back(make_unique<VarDeclStmt>(name, move(init)));
+            } while (match(TokenType::COMMA));
             consume(TokenType::SEMICOLON);
-            return make_unique<VarDeclStmt>(name, move(init));
+            // 如果只有一个声明，直接返回它
+            if (stmtList->stmts.size() == 1) {
+                return move(stmtList->stmts[0]);
+            }
+            return stmtList;
         }
         if (check(TokenType::IDENT) && tokens[current + 1].type == TokenType::ASSIGN) {
             string name = consume(TokenType::IDENT).value;
@@ -577,6 +596,12 @@ private:
 
         if (dynamic_cast<EmptyStmt*>(stmt)) return;
 
+        // StmtList 不创建新作用域（用于多变量声明）
+        if (auto* stmtList = dynamic_cast<StmtList*>(stmt)) {
+            for (auto& s : stmtList->stmts) genStmt(s.get());
+            return;
+        }
+
         if (auto* varDecl = dynamic_cast<VarDeclStmt*>(stmt)) {
             genExpr(varDecl->init.get());
             int offset = allocVar(varDecl->name);
@@ -660,6 +685,8 @@ private:
         int count = 0;
         if (auto* block = dynamic_cast<BlockStmt*>(stmt)) {
             for (auto& s : block->stmts) count += countLocalVars(s.get());
+        } else if (auto* stmtList = dynamic_cast<StmtList*>(stmt)) {
+            for (auto& s : stmtList->stmts) count += countLocalVars(s.get());
         } else if (dynamic_cast<VarDeclStmt*>(stmt)) {
             count = 1;
         } else if (auto* ifStmt = dynamic_cast<IfStmt*>(stmt)) {
@@ -714,6 +741,13 @@ private:
         for (auto& stmt : func->body->stmts) {
             genStmt(stmt.get());
         }
+
+        // 添加隐式返回（防止函数末尾没有return导致段错误）
+        emit("li a0, 0");  // 默认返回0
+        emit("lw ra, " + to_string(frameSize - 4) + "(sp)");
+        emit("lw s0, " + to_string(frameSize - 8) + "(sp)");
+        emit("addi sp, sp, " + to_string(frameSize));
+        emit("ret");
 
         out << "\n";
     }

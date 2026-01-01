@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(make clean:*)",
+      "Bash(make:*)",
+      "Bash(git add:*)",
+      "Bash(git push:*)",
+      "Bash(cat:*)",
+      "Bash(git commit:*)",
+      "Bash(g++:*)",
+      "Bash(./compiler.exe)",
+      "Bash(echo:*)",
+      "Bash(git rm:*)",
+      "Bash(git reset:*)",
+      "Bash(ping:*)",
+      "Bash(dir /s /b \"c:\\\\Users\\\\Administrator\\\\Desktop\\\\词法分析器\\\\*.c\")",
+      "Bash(dir:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
