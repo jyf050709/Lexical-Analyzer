@@ -43,19 +43,19 @@ PrimaryExpr → ID | NUMBER | "(" Expr ")" | ID "(" (Expr ("," Expr)*)? ")"
 | 语法 | 示例 | 错误类型 |
 |------|------|----------|
 | 逗号表达式 | `(1, 2)` | Parse error |
-| ~~三元运算符~~ | ~~`a ? b : c`~~ | ~~Parse error~~ ✓ 已修复 |
-| ~~位运算 AND~~ | ~~`1 & 2`~~ | ~~Parse error~~ ✓ 已修复 |
-| ~~位运算 OR~~ | ~~`1 \| 2`~~ | ~~Parse error~~ ✓ 已修复 |
-| ~~位运算 XOR~~ | ~~`1 ^ 2`~~ | ~~Parse error~~ ✓ 已修复 |
-| ~~位运算 NOT~~ | ~~`~1`~~ | ~~Parse error~~ ✓ 已修复 |
+| 三元运算符 | `a ? b : c` | Parse error |
+| 位运算 AND | `1 & 2` | Parse error |
+| 位运算 OR | `1 \| 2` | Parse error |
+| 位运算 XOR | `1 ^ 2` | Parse error |
+| 位运算 NOT | `~1` | Parse error |
 | 数组声明 | `int arr[10]` | Parse error |
 | 十六进制 | `0x10` | Parse error |
 | 指针声明 | `int *p` | Parse error |
 | do-while | `do {} while(0)` | Parse error |
 | for循环 | `for(...)` | Parse error |
 | 后缀自增 | `x++` | Expected expression |
-| ~~左移~~ | ~~`1 << 2`~~ | ~~Expected expression~~ ✓ 已修复 |
-| ~~右移~~ | ~~`4 >> 1`~~ | ~~Expected expression~~ ✓ 已修复 |
+| 左移 | `1 << 2` | Expected expression |
+| 右移 | `4 >> 1` | Expected expression |
 | sizeof | `sizeof(int)` | Expected expression |
 | 类型转换 | `(int)1` | Expected expression |
 | 字符字面量 | `'a'` | Undefined variable |
@@ -66,9 +66,6 @@ PrimaryExpr → ID | NUMBER | "(" Expr ")" | ID "(" (Expr ("," Expr)*)? ")"
 - **全局变量**: `int x = 1; int main() { return x; }` ✓
 - **全局变量+局部遮蔽**: `int x = 1; int main() { int x = 2; return x; }` ✓
 - **全局变量+加法**: `int x = 1; int main() { x = x + 1; return x; }` ✓
-- **位运算符**: `3 & 1`, `2 | 1`, `3 ^ 1`, `~0` ✓
-- **移位运算符**: `1 << 2`, `8 >> 2` ✓
-- **三元运算符**: `1 ? 2 : 3` ✓
 
 ---
 
