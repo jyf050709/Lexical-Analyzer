@@ -18,6 +18,12 @@ enum class TokenType {
     PLUS_ASSIGN, MINUS_ASSIGN, STAR_ASSIGN, SLASH_ASSIGN, MOD_ASSIGN,
     LT, GT, LE, GE, EQ, NE,
     AND, OR, NOT, ASSIGN,
+    // 位运算符
+    BIT_AND, BIT_OR, BIT_XOR, BIT_NOT,
+    // 移位运算符
+    SHL, SHR,
+    // 三元运算符
+    QUESTION, COLON,
     LPAREN, RPAREN, LBRACE, RBRACE, SEMICOLON, COMMA,
     END_OF_FILE
 };
@@ -124,6 +130,8 @@ public:
             if (ch == '!' && peek(1) == '=') { addToken(TokenType::NE, "!="); advance(); advance(); continue; }
             if (ch == '&' && peek(1) == '&') { addToken(TokenType::AND, "&&"); advance(); advance(); continue; }
             if (ch == '|' && peek(1) == '|') { addToken(TokenType::OR, "||"); advance(); advance(); continue; }
+            if (ch == '<' && peek(1) == '<') { addToken(TokenType::SHL, "<<"); advance(); advance(); continue; }
+            if (ch == '>' && peek(1) == '>') { addToken(TokenType::SHR, ">>"); advance(); advance(); continue; }
 
             switch (ch) {
                 case '+': addToken(TokenType::PLUS, "+"); break;
@@ -135,6 +143,12 @@ public:
                 case '>': addToken(TokenType::GT, ">"); break;
                 case '=': addToken(TokenType::ASSIGN, "="); break;
                 case '!': addToken(TokenType::NOT, "!"); break;
+                case '&': addToken(TokenType::BIT_AND, "&"); break;
+                case '|': addToken(TokenType::BIT_OR, "|"); break;
+                case '^': addToken(TokenType::BIT_XOR, "^"); break;
+                case '~': addToken(TokenType::BIT_NOT, "~"); break;
+                case '?': addToken(TokenType::QUESTION, "?"); break;
+                case ':': addToken(TokenType::COLON, ":"); break;
                 case '(': addToken(TokenType::LPAREN, "("); break;
                 case ')': addToken(TokenType::RPAREN, ")"); break;
                 case '{': addToken(TokenType::LBRACE, "{"); break;
@@ -436,7 +450,23 @@ private:
             // 不是赋值，回溯
             current = savedPos;
         }
-        return parseLOr();
+        return parseTernary();
+    }
+
+    // 三元运算符 (右结合)
+    unique_ptr<Expr> parseTernary() {
+        auto cond = parseLOr();
+        if (match(TokenType::QUESTION)) {
+            auto thenExpr = parseExpr();
+            consume(TokenType::COLON);
+            auto elseExpr = parseTernary();
+            // 用 BinaryExpr 的特殊形式表示，或创建 TernaryExpr
+            // 这里用嵌套的方式：先计算条件，然后选择分支
+            auto ternary = make_unique<BinaryExpr>("?:", move(cond), nullptr);
+            ternary->right = make_unique<BinaryExpr>(":", move(thenExpr), move(elseExpr));
+            return ternary;
+        }
+        return cond;
     }
 
     unique_ptr<Expr> parseLOr() {
@@ -446,21 +476,61 @@ private:
     }
 
     unique_ptr<Expr> parseLAnd() {
+        auto left = parseBitOr();
+        while (match(TokenType::AND)) left = make_unique<BinaryExpr>("&&", move(left), parseBitOr());
+        return left;
+    }
+
+    unique_ptr<Expr> parseBitOr() {
+        auto left = parseBitXor();
+        while (match(TokenType::BIT_OR)) left = make_unique<BinaryExpr>("|", move(left), parseBitXor());
+        return left;
+    }
+
+    unique_ptr<Expr> parseBitXor() {
+        auto left = parseBitAnd();
+        while (match(TokenType::BIT_XOR)) left = make_unique<BinaryExpr>("^", move(left), parseBitAnd());
+        return left;
+    }
+
+    unique_ptr<Expr> parseBitAnd() {
+        auto left = parseEquality();
+        while (match(TokenType::BIT_AND)) left = make_unique<BinaryExpr>("&", move(left), parseEquality());
+        return left;
+    }
+
+    unique_ptr<Expr> parseEquality() {
         auto left = parseRel();
-        while (match(TokenType::AND)) left = make_unique<BinaryExpr>("&&", move(left), parseRel());
+        while (true) {
+            string op;
+            if (match(TokenType::EQ)) op = "==";
+            else if (match(TokenType::NE)) op = "!=";
+            else break;
+            left = make_unique<BinaryExpr>(op, move(left), parseRel());
+        }
         return left;
     }
 
     unique_ptr<Expr> parseRel() {
-        auto left = parseAdd();
+        auto left = parseShift();
         while (true) {
             string op;
             if (match(TokenType::LT)) op = "<";
             else if (match(TokenType::GT)) op = ">";
             else if (match(TokenType::LE)) op = "<=";
             else if (match(TokenType::GE)) op = ">=";
-            else if (match(TokenType::EQ)) op = "==";
-            else if (match(TokenType::NE)) op = "!=";
+            else break;
+            left = make_unique<BinaryExpr>(op, move(left), parseShift());
+        }
+        return left;
+    }
+
+    unique_ptr<Expr> parseShift() {
+        auto left = parseAdd();
+        while (true) {
+            string op;
+            if (match(TokenType::SHL)) op = "<<";
+            else if (match(TokenType::SHR)) op = ">>";
             else break;
             left = make_unique<BinaryExpr>(op, move(left), parseAdd());
         }
@@ -496,6 +566,7 @@ private:
         if (match(TokenType::PLUS)) return make_unique<UnaryExpr>("+", parseUnary());
         if (match(TokenType::MINUS)) return make_unique<UnaryExpr>("-", parseUnary());
         if (match(TokenType::NOT)) return make_unique<UnaryExpr>("!", parseUnary());
+        if (match(TokenType::BIT_NOT)) return make_unique<UnaryExpr>("~", parseUnary());
         return parsePrimary();
     }
 
@@ -558,10 +629,19 @@ private:
             if (unary->op == "+") return operand;
             if (unary->op == "-") return -operand;
             if (unary->op == "!") return operand == 0 ? 1 : 0;
+            if (unary->op == "~") return ~operand;
             throw runtime_error("Unsupported unary operator in global initializer");
         }
 
         if (auto* binary = dynamic_cast<BinaryExpr*>(expr)) {
+            // 三元运算符
+            if (binary->op == "?:") {
+                int cond = evalConstExpr(binary->left.get());
+                auto* branches = dynamic_cast<BinaryExpr*>(binary->right.get());
+                if (cond != 0) return evalConstExpr(branches->left.get());
+                else return evalConstExpr(branches->right.get());
+            }
+
             if (binary->op == "&&") {
                 int left = evalConstExpr(binary->left.get());
                 if (left == 0) return 0;
@@ -596,6 +676,13 @@ private:
             if (binary->op == ">=") return left >= right ? 1 : 0;
             if (binary->op == "==") return left == right ? 1 : 0;
             if (binary->op == "!=") return left != right ? 1 : 0;
+            // 位运算
+            if (binary->op == "&") return left & right;
+            if (binary->op == "|") return left | right;
+            if (binary->op == "^") return left ^ right;
+            // 移位运算
+            if (binary->op == "<<") return left << right;
+            if (binary->op == ">>") return left >> right;
             throw runtime_error("Unsupported binary operator in global initializer");
         }
 
@@ -664,12 +751,30 @@ private:
                 emit("neg t0, t0");
             } else if (unary->op == "!") {
                 emit("seqz t0, t0");
+            } else if (unary->op == "~") {
+                emit("not t0, t0");
             }
             // +x 不需要处理
             return;
         }
 
         if (auto* binary = dynamic_cast<BinaryExpr*>(expr)) {
+            // 三元运算符
+            if (binary->op == "?:") {
+                string falseLabel = newLabel();
+                string endLabel = newLabel();
+                genExpr(binary->left.get());  // 条件
+                emit("beqz t0, " + falseLabel);
+                // binary->right 是一个 BinaryExpr(":", thenExpr, elseExpr)
+                auto* branches = dynamic_cast<BinaryExpr*>(binary->right.get());
+                genExpr(branches->left.get());  // then 分支
+                emit("j " + endLabel);
+                emitLabel(falseLabel);
+                genExpr(branches->right.get());  // else 分支
+                emitLabel(endLabel);
+                return;
+            }
+
             // 短路求值
             if (binary->op == "&&") {
                 string falseLabel = newLabel();
@@ -721,6 +826,13 @@ private:
             else if (binary->op == ">=") { emit("slt t0, t0, t1"); emit("xori t0, t0, 1"); }
             else if (binary->op == "==") { emit("sub t0, t0, t1"); emit("seqz t0, t0"); }
             else if (binary->op == "!=") { emit("sub t0, t0, t1"); emit("snez t0, t0"); }
+            // 位运算
+            else if (binary->op == "&") emit("and t0, t0, t1");
+            else if (binary->op == "|") emit("or t0, t0, t1");
+            else if (binary->op == "^") emit("xor t0, t0, t1");
+            // 移位运算
+            else if (binary->op == "<<") emit("sll t0, t0, t1");
+            else if (binary->op == ">>") emit("sra t0, t0, t1");
             return;
         }
 

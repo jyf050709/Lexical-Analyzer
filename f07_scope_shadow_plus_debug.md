@@ -43,22 +43,32 @@ PrimaryExpr → ID | NUMBER | "(" Expr ")" | ID "(" (Expr ("," Expr)*)? ")"
 | 语法 | 示例 | 错误类型 |
 |------|------|----------|
 | 逗号表达式 | `(1, 2)` | Parse error |
-| 三元运算符 | `a ? b : c` | Parse error |
-| 位运算 AND | `1 & 2` | Parse error |
-| 位运算 OR | `1 \| 2` | Parse error |
-| 位运算 XOR | `1 ^ 2` | Parse error |
+| ~~三元运算符~~ | ~~`a ? b : c`~~ | ~~Parse error~~ ✓ 已修复 |
+| ~~位运算 AND~~ | ~~`1 & 2`~~ | ~~Parse error~~ ✓ 已修复 |
+| ~~位运算 OR~~ | ~~`1 \| 2`~~ | ~~Parse error~~ ✓ 已修复 |
+| ~~位运算 XOR~~ | ~~`1 ^ 2`~~ | ~~Parse error~~ ✓ 已修复 |
+| ~~位运算 NOT~~ | ~~`~1`~~ | ~~Parse error~~ ✓ 已修复 |
 | 数组声明 | `int arr[10]` | Parse error |
 | 十六进制 | `0x10` | Parse error |
 | 指针声明 | `int *p` | Parse error |
 | do-while | `do {} while(0)` | Parse error |
 | for循环 | `for(...)` | Parse error |
 | 后缀自增 | `x++` | Expected expression |
-| 左移 | `1 << 2` | Expected expression |
-| 右移 | `4 >> 1` | Expected expression |
+| ~~左移~~ | ~~`1 << 2`~~ | ~~Expected expression~~ ✓ 已修复 |
+| ~~右移~~ | ~~`4 >> 1`~~ | ~~Expected expression~~ ✓ 已修复 |
 | sizeof | `sizeof(int)` | Expected expression |
 | 类型转换 | `(int)1` | Expected expression |
 | 字符字面量 | `'a'` | Undefined variable |
 | const | `const int x` | Expected type |
+
+## 已修复并验证通过的功能 ✓
+
+- **全局变量**: `int x = 1; int main() { return x; }` ✓
+- **全局变量+局部遮蔽**: `int x = 1; int main() { int x = 2; return x; }` ✓
+- **全局变量+加法**: `int x = 1; int main() { x = x + 1; return x; }` ✓
+- **位运算符**: `3 & 1`, `2 | 1`, `3 ^ 1`, `~0` ✓
+- **移位运算符**: `1 << 2`, `8 >> 2` ✓
+- **三元运算符**: `1 ? 2 : 3` ✓
 
 ---
 
@@ -101,13 +111,33 @@ int x = (x + 1) * 2;  ✓
 ## 结论
 
 **所有与 "scope_shadow_plus" 直接相关的语法模式均已测试通过。**
+**全局变量支持已添加并测试通过。**
 
-错误可能来自测试代码使用了不支持的语法，最可能的原因：
+### 已验证的完整测试列表：
 
-1. **逗号表达式** `(a, b)` - 常见于复杂表达式
-2. **位运算符** `&`, `|`, `^` - 常见于算法
-3. **三元运算符** `?:` - 常见于简洁写法
-4. **do-while** 循环
+| 测试模式 | 代码示例 | 结果 |
+|----------|----------|------|
+| 基本作用域遮蔽+加法 | `int x=1; { int x=x+1; }` | ✓ |
+| 多层嵌套遮蔽 | `{ int x=2; { int x=x+x; } }` | ✓ |
+| 参数遮蔽+加法 | `int f(int x) { int x=x+1; }` | ✓ |
+| if中遮蔽+加法 | `if(x) { int x=x+2; return x; }` | ✓ |
+| while中遮蔽 | `while(x) { int x=0; }` | ✓ |
+| 链式赋值 | `y = x = x + 1;` | ✓ |
+| 全局变量+遮蔽 | `int x=1; int main() { int x=2; }` | ✓ |
+| 全局变量+加法 | `int x=1; int main() { x=x+1; }` | ✓ |
+| 逻辑表达式 | `x \|\| 1`, `x && 1` | ✓ |
+| 复杂表达式 | `1 + 2 * 3` | ✓ |
+| 表达式语句 | `x + 1;` | ✓ |
+| 函数调用语句 | `f(x+1);` | ✓ |
+| void return | `void f() { return; }` | ✓ |
+
+### 错误可能来自不支持的语法：
+
+1. **逗号表达式** `(a, b)` - Parse error
+2. **位运算符** `&`, `|`, `^` - Parse error
+3. **三元运算符** `?:` - Parse error
+4. **do-while** 循环 - Parse error
+5. **for循环** - Parse error
 
 ---
 
