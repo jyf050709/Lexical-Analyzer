@@ -15,6 +15,7 @@ enum class TokenType {
     INT, VOID, IF, ELSE, WHILE, BREAK, CONTINUE, RETURN,
     IDENT, INT_CONST,
     PLUS, MINUS, STAR, SLASH, MOD,
+    PLUS_ASSIGN, MINUS_ASSIGN, STAR_ASSIGN, SLASH_ASSIGN, MOD_ASSIGN,
     LT, GT, LE, GE, EQ, NE,
     AND, OR, NOT, ASSIGN,
     LPAREN, RPAREN, LBRACE, RBRACE, SEMICOLON, COMMA,
@@ -112,6 +113,11 @@ public:
                 continue;
             }
 
+            if (ch == '+' && peek(1) == '=') { addToken(TokenType::PLUS_ASSIGN, "+="); advance(); advance(); continue; }
+            if (ch == '-' && peek(1) == '=') { addToken(TokenType::MINUS_ASSIGN, "-="); advance(); advance(); continue; }
+            if (ch == '*' && peek(1) == '=') { addToken(TokenType::STAR_ASSIGN, "*="); advance(); advance(); continue; }
+            if (ch == '/' && peek(1) == '=') { addToken(TokenType::SLASH_ASSIGN, "/="); advance(); advance(); continue; }
+            if (ch == '%' && peek(1) == '=') { addToken(TokenType::MOD_ASSIGN, "%="); advance(); advance(); continue; }
             if (ch == '<' && peek(1) == '=') { addToken(TokenType::LE, "<="); advance(); advance(); continue; }
             if (ch == '>' && peek(1) == '=') { addToken(TokenType::GE, ">="); advance(); advance(); continue; }
             if (ch == '=' && peek(1) == '=') { addToken(TokenType::EQ, "=="); advance(); advance(); continue; }
@@ -341,6 +347,27 @@ private:
             consume(TokenType::SEMICOLON);
             return make_unique<AssignStmt>(name, move(val));
         }
+        // 复合赋值: x += expr 等价于 x = x + expr
+        if (check(TokenType::IDENT)) {
+            TokenType nextType = tokens[current + 1].type;
+            string op;
+            if (nextType == TokenType::PLUS_ASSIGN) op = "+";
+            else if (nextType == TokenType::MINUS_ASSIGN) op = "-";
+            else if (nextType == TokenType::STAR_ASSIGN) op = "*";
+            else if (nextType == TokenType::SLASH_ASSIGN) op = "/";
+            else if (nextType == TokenType::MOD_ASSIGN) op = "%";
+
+            if (!op.empty()) {
+                string name = consume(TokenType::IDENT).value;
+                current++;  // 跳过复合赋值运算符
+                auto rhs = parseExpr();
+                consume(TokenType::SEMICOLON);
+                // 构造 x = x op rhs
+                auto left = make_unique<IdentExpr>(name);
+                auto binExpr = make_unique<BinaryExpr>(op, move(left), move(rhs));
+                return make_unique<AssignStmt>(name, move(binExpr));
+            }
+        }
         auto expr = parseExpr();
         consume(TokenType::SEMICOLON);
         return make_unique<ExprStmt>(move(expr));
@@ -492,7 +519,7 @@ private:
             int offset = lookupVar(ident->name, paramIdx);
             if (paramIdx >= 0) {
                 // 从参数存储位置加载
-                emit("lw t0, " + to_string(-4 - paramIdx * 4) + "(s0)");
+                emit("lw t0, " + to_string(-12 - paramIdx * 4) + "(s0)");
             } else {
                 emit("lw t0, " + to_string(offset) + "(s0)");
             }
@@ -614,7 +641,7 @@ private:
             int paramIdx;
             int offset = lookupVar(assign->name, paramIdx);
             if (paramIdx >= 0) {
-                emit("sw t0, " + to_string(-4 - paramIdx * 4) + "(s0)");
+                emit("sw t0, " + to_string(-12 - paramIdx * 4) + "(s0)");
             } else {
                 emit("sw t0, " + to_string(offset) + "(s0)");
             }
@@ -729,13 +756,14 @@ private:
         emit("sw s0, " + to_string(frameSize - 8) + "(sp)");
         emit("addi s0, sp, " + to_string(frameSize));
 
-        // 保存参数
+        // 保存参数（在 ra 和 s0 之后，从 s0-12 开始）
+        // 栈布局: s0-4=ra, s0-8=s0, s0-12=param0, s0-16=param1, ...
         for (int i = 0; i < paramCount && i < 8; i++) {
-            emit("sw a" + to_string(i) + ", " + to_string(-4 - i * 4) + "(s0)");
+            emit("sw a" + to_string(i) + ", " + to_string(-12 - i * 4) + "(s0)");
         }
 
-        // 设置局部变量起始偏移（在参数之后）
-        stackOffset = -4 - paramCount * 4;
+        // 设置局部变量起始偏移（跳过 ra、s0 和参数）
+        stackOffset = -8 - paramCount * 4;
 
         // 生成函数体
         for (auto& stmt : func->body->stmts) {
