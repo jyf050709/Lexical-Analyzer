@@ -1046,16 +1046,350 @@ private:
         }
     }
 
+    // 收集循环内被修改的变量
+    void collectModifiedVars(Stmt* stmt, set<string>& modified) {
+        switch (stmt->kind) {
+        case StmtKind::BLOCK: {
+            auto* block = static_cast<BlockStmt*>(stmt);
+            for (auto& s : block->stmts) collectModifiedVars(s.get(), modified);
+            break;
+        }
+        case StmtKind::VARDECL:
+            modified.insert(static_cast<VarDeclStmt*>(stmt)->name);
+            break;
+        case StmtKind::ASSIGN:
+            modified.insert(static_cast<AssignStmt*>(stmt)->name);
+            break;
+        case StmtKind::IF: {
+            auto* i = static_cast<IfStmt*>(stmt);
+            collectModifiedVars(i->thenStmt.get(), modified);
+            if (i->elseStmt) collectModifiedVars(i->elseStmt.get(), modified);
+            break;
+        }
+        case StmtKind::WHILE: {
+            auto* w = static_cast<WhileStmt*>(stmt);
+            collectModifiedVars(w->body.get(), modified);
+            break;
+        }
+        default:
+            break;
+        }
+    }
+
+    // 检查表达式是否是循环不变量
+    bool isLoopInvariant(Expr* expr, const set<string>& modifiedVars) {
+        switch (expr->kind) {
+        case ExprKind::NUMBER:
+            return true;
+        case ExprKind::IDENT:
+            return modifiedVars.find(static_cast<IdentExpr*>(expr)->name) == modifiedVars.end();
+        case ExprKind::UNARY:
+            return isLoopInvariant(static_cast<UnaryExpr*>(expr)->operand.get(), modifiedVars);
+        case ExprKind::BINARY: {
+            auto* b = static_cast<BinaryExpr*>(expr);
+            return isLoopInvariant(b->left.get(), modifiedVars) &&
+                   isLoopInvariant(b->right.get(), modifiedVars);
+        }
+        case ExprKind::CALL:
+            return false;  // 函数调用不是循环不变量（可能有副作用）
+        }
+        return false;
+    }
+
+    // 循环不变量外提
+    void hoistLoopInvariants(WhileStmt* whileStmt, vector<unique_ptr<Stmt>>& hoisted) {
+        if (whileStmt->body->kind != StmtKind::BLOCK) return;
+        auto* body = static_cast<BlockStmt*>(whileStmt->body.get());
+
+        // 收集循环内被修改的变量
+        set<string> modifiedVars;
+        collectModifiedVars(whileStmt->body.get(), modifiedVars);
+
+        // 遍历循环体，提取可外提的语句
+        for (auto it = body->stmts.begin(); it != body->stmts.end(); ) {
+            Stmt* stmt = it->get();
+
+            if (stmt->kind == StmtKind::VARDECL) {
+                auto* varDecl = static_cast<VarDeclStmt*>(stmt);
+                // 如果初始化表达式是循环不变量，且变量在循环中不被再次赋值
+                if (isLoopInvariant(varDecl->init.get(), modifiedVars)) {
+                    // 检查这个变量是否在循环体其他地方被修改
+                    set<string> otherMods;
+                    for (auto& s : body->stmts) {
+                        if (s.get() != stmt) {
+                            collectModifiedVars(s.get(), otherMods);
+                        }
+                    }
+                    if (otherMods.find(varDecl->name) == otherMods.end()) {
+                        hoisted.push_back(move(*it));
+                        it = body->stmts.erase(it);
+                        continue;
+                    }
+                }
+            }
+            ++it;
+        }
+    }
+
+    // 公共子表达式消除：表达式 -> 临时变量名
+    map<string, string> cseMap;
+    int cseTempCount = 0;
+
+    // 对表达式进行 CSE，返回优化后的表达式
+    unique_ptr<Expr> cseExpr(Expr* expr, vector<unique_ptr<Stmt>>& preStmts) {
+        switch (expr->kind) {
+        case ExprKind::NUMBER:
+            return make_unique<NumberExpr>(static_cast<NumberExpr*>(expr)->value);
+        case ExprKind::IDENT:
+            return make_unique<IdentExpr>(static_cast<IdentExpr*>(expr)->name);
+        case ExprKind::UNARY: {
+            auto* u = static_cast<UnaryExpr*>(expr);
+            auto operand = cseExpr(u->operand.get(), preStmts);
+            return make_unique<UnaryExpr>(u->op, move(operand));
+        }
+        case ExprKind::BINARY: {
+            auto* b = static_cast<BinaryExpr*>(expr);
+            auto left = cseExpr(b->left.get(), preStmts);
+            auto right = cseExpr(b->right.get(), preStmts);
+
+            // 构建表达式签名
+            auto newExpr = make_unique<BinaryExpr>(b->op, move(left), move(right));
+            string sig = exprToString(newExpr.get());
+
+            // 检查是否已经计算过（只对复杂表达式进行 CSE）
+            if (sig.length() > 10 && !hasCallExpr(newExpr.get())) {
+                if (cseMap.count(sig)) {
+                    return make_unique<IdentExpr>(cseMap[sig]);
+                }
+                // 创建临时变量
+                string tmpName = "__cse_" + to_string(cseTempCount++);
+                cseMap[sig] = tmpName;
+                preStmts.push_back(make_unique<VarDeclStmt>(tmpName, move(newExpr)));
+                return make_unique<IdentExpr>(tmpName);
+            }
+            return newExpr;
+        }
+        case ExprKind::CALL: {
+            auto* c = static_cast<CallExpr*>(expr);
+            auto newCall = make_unique<CallExpr>(c->funcName);
+            for (auto& arg : c->args) {
+                newCall->args.push_back(cseExpr(arg.get(), preStmts));
+            }
+            return newCall;
+        }
+        }
+        return nullptr;
+    }
+
+    // 对语句列表进行 CSE
+    void cseStmtList(vector<unique_ptr<Stmt>>& stmts) {
+        vector<unique_ptr<Stmt>> newStmts;
+
+        for (auto& stmt : stmts) {
+            vector<unique_ptr<Stmt>> preStmts;
+
+            switch (stmt->kind) {
+            case StmtKind::VARDECL: {
+                auto* v = static_cast<VarDeclStmt*>(stmt.get());
+                v->init = cseExpr(v->init.get(), preStmts);
+                // 变量赋值后，包含该变量的 CSE 项失效
+                for (auto it = cseMap.begin(); it != cseMap.end(); ) {
+                    if (it->first.find(v->name) != string::npos) {
+                        it = cseMap.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+                break;
+            }
+            case StmtKind::ASSIGN: {
+                auto* a = static_cast<AssignStmt*>(stmt.get());
+                a->value = cseExpr(a->value.get(), preStmts);
+                // 变量赋值后，包含该变量的 CSE 项失效
+                for (auto it = cseMap.begin(); it != cseMap.end(); ) {
+                    if (it->first.find(a->name) != string::npos) {
+                        it = cseMap.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+                break;
+            }
+            case StmtKind::RETURN: {
+                auto* r = static_cast<ReturnStmt*>(stmt.get());
+                if (r->value) r->value = cseExpr(r->value.get(), preStmts);
+                break;
+            }
+            case StmtKind::IF: {
+                auto* i = static_cast<IfStmt*>(stmt.get());
+                i->cond = cseExpr(i->cond.get(), preStmts);
+                // 分支内的 CSE 需要独立处理
+                map<string, string> savedCse = cseMap;
+                if (i->thenStmt->kind == StmtKind::BLOCK) {
+                    cseStmtList(static_cast<BlockStmt*>(i->thenStmt.get())->stmts);
+                }
+                cseMap = savedCse;
+                if (i->elseStmt && i->elseStmt->kind == StmtKind::BLOCK) {
+                    cseStmtList(static_cast<BlockStmt*>(i->elseStmt.get())->stmts);
+                }
+                cseMap = savedCse;
+                break;
+            }
+            case StmtKind::WHILE: {
+                auto* w = static_cast<WhileStmt*>(stmt.get());
+                // 循环内清空 CSE（保守策略）
+                cseMap.clear();
+                if (w->body->kind == StmtKind::BLOCK) {
+                    cseStmtList(static_cast<BlockStmt*>(w->body.get())->stmts);
+                }
+                cseMap.clear();
+                break;
+            }
+            case StmtKind::EXPR: {
+                auto* e = static_cast<ExprStmt*>(stmt.get());
+                e->expr = cseExpr(e->expr.get(), preStmts);
+                break;
+            }
+            default:
+                break;
+            }
+
+            // 插入预生成的语句
+            for (auto& pre : preStmts) {
+                newStmts.push_back(move(pre));
+            }
+            newStmts.push_back(move(stmt));
+        }
+
+        stmts = move(newStmts);
+    }
+
+    // 死变量消除：收集所有被使用的变量
+    void collectUsedVars(Expr* expr, set<string>& used) {
+        switch (expr->kind) {
+        case ExprKind::IDENT:
+            used.insert(static_cast<IdentExpr*>(expr)->name);
+            break;
+        case ExprKind::UNARY:
+            collectUsedVars(static_cast<UnaryExpr*>(expr)->operand.get(), used);
+            break;
+        case ExprKind::BINARY: {
+            auto* b = static_cast<BinaryExpr*>(expr);
+            collectUsedVars(b->left.get(), used);
+            collectUsedVars(b->right.get(), used);
+            break;
+        }
+        case ExprKind::CALL: {
+            auto* c = static_cast<CallExpr*>(expr);
+            for (auto& arg : c->args) collectUsedVars(arg.get(), used);
+            break;
+        }
+        default:
+            break;
+        }
+    }
+
+    void collectUsedVarsInStmt(Stmt* stmt, set<string>& used) {
+        switch (stmt->kind) {
+        case StmtKind::BLOCK: {
+            auto* b = static_cast<BlockStmt*>(stmt);
+            for (auto& s : b->stmts) collectUsedVarsInStmt(s.get(), used);
+            break;
+        }
+        case StmtKind::VARDECL:
+            collectUsedVars(static_cast<VarDeclStmt*>(stmt)->init.get(), used);
+            break;
+        case StmtKind::ASSIGN: {
+            auto* a = static_cast<AssignStmt*>(stmt);
+            collectUsedVars(a->value.get(), used);
+            break;
+        }
+        case StmtKind::IF: {
+            auto* i = static_cast<IfStmt*>(stmt);
+            collectUsedVars(i->cond.get(), used);
+            collectUsedVarsInStmt(i->thenStmt.get(), used);
+            if (i->elseStmt) collectUsedVarsInStmt(i->elseStmt.get(), used);
+            break;
+        }
+        case StmtKind::WHILE: {
+            auto* w = static_cast<WhileStmt*>(stmt);
+            collectUsedVars(w->cond.get(), used);
+            collectUsedVarsInStmt(w->body.get(), used);
+            break;
+        }
+        case StmtKind::RETURN: {
+            auto* r = static_cast<ReturnStmt*>(stmt);
+            if (r->value) collectUsedVars(r->value.get(), used);
+            break;
+        }
+        case StmtKind::EXPR:
+            collectUsedVars(static_cast<ExprStmt*>(stmt)->expr.get(), used);
+            break;
+        default:
+            break;
+        }
+    }
+
+    // 死变量消除
+    bool eliminateDeadVars(vector<unique_ptr<Stmt>>& stmts) {
+        bool changed = false;
+
+        // 收集所有使用的变量
+        set<string> usedVars;
+        for (auto& stmt : stmts) {
+            collectUsedVarsInStmt(stmt.get(), usedVars);
+        }
+
+        // 删除未使用变量的声明（如果初始化没有副作用）
+        for (auto it = stmts.begin(); it != stmts.end(); ) {
+            if ((*it)->kind == StmtKind::VARDECL) {
+                auto* v = static_cast<VarDeclStmt*>(it->get());
+                if (usedVars.find(v->name) == usedVars.end() &&
+                    !hasCallExpr(v->init.get())) {
+                    it = stmts.erase(it);
+                    changed = true;
+                    continue;
+                }
+            }
+            ++it;
+        }
+
+        // 递归处理嵌套块
+        for (auto& stmt : stmts) {
+            if (stmt->kind == StmtKind::BLOCK) {
+                if (eliminateDeadVars(static_cast<BlockStmt*>(stmt.get())->stmts))
+                    changed = true;
+            } else if (stmt->kind == StmtKind::IF) {
+                auto* i = static_cast<IfStmt*>(stmt.get());
+                if (i->thenStmt->kind == StmtKind::BLOCK) {
+                    if (eliminateDeadVars(static_cast<BlockStmt*>(i->thenStmt.get())->stmts))
+                        changed = true;
+                }
+                if (i->elseStmt && i->elseStmt->kind == StmtKind::BLOCK) {
+                    if (eliminateDeadVars(static_cast<BlockStmt*>(i->elseStmt.get())->stmts))
+                        changed = true;
+                }
+            } else if (stmt->kind == StmtKind::WHILE) {
+                auto* w = static_cast<WhileStmt*>(stmt.get());
+                if (w->body->kind == StmtKind::BLOCK) {
+                    if (eliminateDeadVars(static_cast<BlockStmt*>(w->body.get())->stmts))
+                        changed = true;
+                }
+            }
+        }
+
+        return changed;
+    }
+
 public:
     void optimize(Program* prog) {
-        // 多轮优化直到不再有变化
-        for (int round = 0; round < 5; round++) {
+        // 第一阶段：多轮基础优化
+        for (int round = 0; round < 10; round++) {
             bool changed = false;
             for (auto& func : prog->functions) {
                 constVars.clear();
                 copyVars.clear();
 
-                // 参数不是常量
                 for (auto& p : func->params) {
                     constVars.erase(p->name);
                 }
@@ -1067,16 +1401,56 @@ public:
             if (!changed) break;
         }
 
-        // 尾递归优化（单独一轮）
+        // 第二阶段：循环不变量外提
+        for (auto& func : prog->functions) {
+            auto& stmts = func->body->stmts;
+            for (size_t i = 0; i < stmts.size(); i++) {
+                if (stmts[i]->kind == StmtKind::WHILE) {
+                    vector<unique_ptr<Stmt>> hoisted;
+                    hoistLoopInvariants(static_cast<WhileStmt*>(stmts[i].get()), hoisted);
+                    // 插入到循环前
+                    for (auto it = hoisted.rbegin(); it != hoisted.rend(); ++it) {
+                        stmts.insert(stmts.begin() + i, move(*it));
+                        i++;
+                    }
+                }
+            }
+        }
+
+        // 第三阶段：公共子表达式消除
+        for (auto& func : prog->functions) {
+            cseMap.clear();
+            cseTempCount = 0;
+            cseStmtList(func->body->stmts);
+        }
+
+        // 第四阶段：尾递归优化
         for (auto& func : prog->functions) {
             optimizeTailRecursion(func.get());
         }
 
-        // 最后一轮常量折叠
-        for (auto& func : prog->functions) {
-            constVars.clear();
-            copyVars.clear();
-            optimizeStmtList(func->body->stmts);
+        // 第五阶段：死变量消除
+        for (int round = 0; round < 3; round++) {
+            bool changed = false;
+            for (auto& func : prog->functions) {
+                if (eliminateDeadVars(func->body->stmts)) {
+                    changed = true;
+                }
+            }
+            if (!changed) break;
+        }
+
+        // 最后阶段：再次运行基础优化
+        for (int round = 0; round < 5; round++) {
+            bool changed = false;
+            for (auto& func : prog->functions) {
+                constVars.clear();
+                copyVars.clear();
+                if (optimizeStmtList(func->body->stmts)) {
+                    changed = true;
+                }
+            }
+            if (!changed) break;
         }
     }
 };
