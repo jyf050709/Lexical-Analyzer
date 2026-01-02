@@ -7,6 +7,7 @@
 #include <memory>
 #include <sstream>
 #include <cctype>
+#include <cmath>
 
 using namespace std;
 
@@ -735,11 +736,15 @@ private:
                 // 0 + x = x
                 if (left->kind == ExprKind::NUMBER && getConstValue(left.get()) == 0)
                     return right;
+                // x + x = 2 * x (但保持原样让后端处理)
             }
             if (binary->op == "-") {
                 // x - 0 = x
                 if (right->kind == ExprKind::NUMBER && getConstValue(right.get()) == 0)
                     return left;
+                // 0 - x = -x
+                if (left->kind == ExprKind::NUMBER && getConstValue(left.get()) == 0)
+                    return make_unique<UnaryExpr>("-", move(right));
                 // x - x = 0
                 if (left->kind == ExprKind::IDENT && right->kind == ExprKind::IDENT &&
                     static_cast<IdentExpr*>(left.get())->name == static_cast<IdentExpr*>(right.get())->name)
@@ -756,20 +761,62 @@ private:
                     return left;
                 if (left->kind == ExprKind::NUMBER && getConstValue(left.get()) == 1)
                     return right;
-                // 注：强度削减由归纳变量优化处理，这里不再做 x*2, x*4 的转换
+                // x * -1 = -x
+                if (right->kind == ExprKind::NUMBER && getConstValue(right.get()) == -1)
+                    return make_unique<UnaryExpr>("-", move(left));
+                if (left->kind == ExprKind::NUMBER && getConstValue(left.get()) == -1)
+                    return make_unique<UnaryExpr>("-", move(right));
             }
             if (binary->op == "/") {
                 // x / 1 = x
                 if (right->kind == ExprKind::NUMBER && getConstValue(right.get()) == 1)
                     return left;
+                // x / -1 = -x
+                if (right->kind == ExprKind::NUMBER && getConstValue(right.get()) == -1)
+                    return make_unique<UnaryExpr>("-", move(left));
                 // x / x = 1 (assuming x != 0)
                 if (left->kind == ExprKind::IDENT && right->kind == ExprKind::IDENT &&
                     static_cast<IdentExpr*>(left.get())->name == static_cast<IdentExpr*>(right.get())->name)
                     return make_unique<NumberExpr>(1);
+                // 0 / x = 0 (assuming x != 0)
+                if (left->kind == ExprKind::NUMBER && getConstValue(left.get()) == 0)
+                    return make_unique<NumberExpr>(0);
             }
             if (binary->op == "%") {
                 // x % 1 = 0
                 if (right->kind == ExprKind::NUMBER && getConstValue(right.get()) == 1)
+                    return make_unique<NumberExpr>(0);
+                // x % x = 0 (assuming x != 0)
+                if (left->kind == ExprKind::IDENT && right->kind == ExprKind::IDENT &&
+                    static_cast<IdentExpr*>(left.get())->name == static_cast<IdentExpr*>(right.get())->name)
+                    return make_unique<NumberExpr>(0);
+                // 0 % x = 0
+                if (left->kind == ExprKind::NUMBER && getConstValue(left.get()) == 0)
+                    return make_unique<NumberExpr>(0);
+            }
+            // 比较优化
+            if (binary->op == "<" || binary->op == ">") {
+                // x < x = 0, x > x = 0
+                if (left->kind == ExprKind::IDENT && right->kind == ExprKind::IDENT &&
+                    static_cast<IdentExpr*>(left.get())->name == static_cast<IdentExpr*>(right.get())->name)
+                    return make_unique<NumberExpr>(0);
+            }
+            if (binary->op == "<=" || binary->op == ">=") {
+                // x <= x = 1, x >= x = 1
+                if (left->kind == ExprKind::IDENT && right->kind == ExprKind::IDENT &&
+                    static_cast<IdentExpr*>(left.get())->name == static_cast<IdentExpr*>(right.get())->name)
+                    return make_unique<NumberExpr>(1);
+            }
+            if (binary->op == "==") {
+                // x == x = 1
+                if (left->kind == ExprKind::IDENT && right->kind == ExprKind::IDENT &&
+                    static_cast<IdentExpr*>(left.get())->name == static_cast<IdentExpr*>(right.get())->name)
+                    return make_unique<NumberExpr>(1);
+            }
+            if (binary->op == "!=") {
+                // x != x = 0
+                if (left->kind == ExprKind::IDENT && right->kind == ExprKind::IDENT &&
+                    static_cast<IdentExpr*>(left.get())->name == static_cast<IdentExpr*>(right.get())->name)
                     return make_unique<NumberExpr>(0);
             }
             // 短路求值优化
@@ -778,11 +825,19 @@ private:
                     if (getConstValue(left.get()) == 0) return make_unique<NumberExpr>(0);
                     else return right;
                 }
+                if (right->kind == ExprKind::NUMBER) {
+                    if (getConstValue(right.get()) == 0) return make_unique<NumberExpr>(0);
+                    // 1 && x = x (需要保证x被求值，但结果就是x)
+                }
             }
             if (binary->op == "||") {
                 if (left->kind == ExprKind::NUMBER) {
                     if (getConstValue(left.get()) != 0) return make_unique<NumberExpr>(1);
                     else return right;
+                }
+                if (right->kind == ExprKind::NUMBER) {
+                    if (getConstValue(right.get()) != 0) return make_unique<NumberExpr>(1);
+                    // 0 || x = x
                 }
             }
 
@@ -907,7 +962,9 @@ private:
                     // 清除条件分支中的常量信息（保守分析）
                     map<string, int> savedConst = constVars;
                     map<string, string> savedCopy = copyVars;
-                    optimizeStmtList(static_cast<BlockStmt*>(ifStmt->thenStmt.get())->stmts);
+                    if (ifStmt->thenStmt->kind == StmtKind::BLOCK) {
+                        optimizeStmtList(static_cast<BlockStmt*>(ifStmt->thenStmt.get())->stmts);
+                    }
                     constVars = savedConst;
                     copyVars = savedCopy;
                     if (ifStmt->elseStmt) {
@@ -1026,11 +1083,11 @@ private:
                 // 添加 continue
                 loopBody->stmts.push_back(make_unique<ContinueStmt>());
 
-                // 组合循环体
-                for (auto& s : outerBody->stmts) {
+                // 组合循环体：反向遍历以保持原始顺序
+                for (auto it = outerBody->stmts.rbegin(); it != outerBody->stmts.rend(); ++it) {
                     static_cast<BlockStmt*>(loopBody.get())->stmts.insert(
                         static_cast<BlockStmt*>(loopBody.get())->stmts.begin(),
-                        move(s));
+                        move(*it));
                 }
 
                 whileStmt->body = move(loopBody);
@@ -1154,7 +1211,7 @@ private:
             string sig = exprToString(newExpr.get());
 
             // 检查是否已经计算过（只对复杂表达式进行 CSE）
-            if (sig.length() > 10 && !hasCallExpr(newExpr.get())) {
+            if (sig.length() > 5 && !hasCallExpr(newExpr.get())) {
                 if (cseMap.count(sig)) {
                     return make_unique<IdentExpr>(cseMap[sig]);
                 }
@@ -1221,6 +1278,24 @@ private:
                 auto* i = static_cast<IfStmt*>(stmt.get());
                 i->cond = cseExpr(i->cond.get(), preStmts);
                 // 分支内不进行CSE（保守策略，避免作用域问题）
+                // 清理可能在分支内被修改的变量的 CSE 项
+                set<string> modifiedVars;
+                collectModifiedVars(i->thenStmt.get(), modifiedVars);
+                if (i->elseStmt) collectModifiedVars(i->elseStmt.get(), modifiedVars);
+                for (auto it = cseMap.begin(); it != cseMap.end(); ) {
+                    bool shouldErase = false;
+                    for (const auto& var : modifiedVars) {
+                        if (it->first.find(var) != string::npos) {
+                            shouldErase = true;
+                            break;
+                        }
+                    }
+                    if (shouldErase) {
+                        it = cseMap.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
                 break;
             }
             case StmtKind::WHILE: {
@@ -1836,6 +1911,193 @@ private:
                 emitLabel(endLabel);
                 break;
             }
+            // ========== 乘法优化 ==========
+            if (g_optimize && binary->op == "*") {
+                // 检查右操作数是否为常量
+                if (binary->right->kind == ExprKind::NUMBER) {
+                    int val = static_cast<NumberExpr*>(binary->right.get())->value;
+
+                    // 2的幂 -> 移位
+                    if (val > 0 && (val & (val - 1)) == 0) {
+                        genExpr(binary->left.get());
+                        int shift = 0;
+                        int tmp = val;
+                        while (tmp > 1) { tmp >>= 1; shift++; }
+                        emit("slli t0, t0, " + to_string(shift));
+                        break;
+                    }
+
+                    // x * 3 = (x << 1) + x
+                    if (val == 3) {
+                        genExpr(binary->left.get());
+                        emit("slli t1, t0, 1");
+                        emit("add t0, t1, t0");
+                        break;
+                    }
+
+                    // x * 5 = (x << 2) + x
+                    if (val == 5) {
+                        genExpr(binary->left.get());
+                        emit("slli t1, t0, 2");
+                        emit("add t0, t1, t0");
+                        break;
+                    }
+
+                    // x * 6 = (x << 2) + (x << 1)
+                    if (val == 6) {
+                        genExpr(binary->left.get());
+                        emit("slli t1, t0, 2");
+                        emit("slli t2, t0, 1");
+                        emit("add t0, t1, t2");
+                        break;
+                    }
+
+                    // x * 7 = (x << 3) - x
+                    if (val == 7) {
+                        genExpr(binary->left.get());
+                        emit("slli t1, t0, 3");
+                        emit("sub t0, t1, t0");
+                        break;
+                    }
+
+                    // x * 9 = (x << 3) + x
+                    if (val == 9) {
+                        genExpr(binary->left.get());
+                        emit("slli t1, t0, 3");
+                        emit("add t0, t1, t0");
+                        break;
+                    }
+
+                    // x * 10 = (x << 3) + (x << 1)
+                    if (val == 10) {
+                        genExpr(binary->left.get());
+                        emit("slli t1, t0, 3");
+                        emit("slli t2, t0, 1");
+                        emit("add t0, t1, t2");
+                        break;
+                    }
+
+                    // x * 15 = (x << 4) - x
+                    if (val == 15) {
+                        genExpr(binary->left.get());
+                        emit("slli t1, t0, 4");
+                        emit("sub t0, t1, t0");
+                        break;
+                    }
+                }
+
+                // 检查左操作数是否为常量（交换律）
+                if (binary->left->kind == ExprKind::NUMBER) {
+                    int val = static_cast<NumberExpr*>(binary->left.get())->value;
+
+                    // 2的幂 -> 移位
+                    if (val > 0 && (val & (val - 1)) == 0) {
+                        genExpr(binary->right.get());
+                        int shift = 0;
+                        int tmp = val;
+                        while (tmp > 1) { tmp >>= 1; shift++; }
+                        emit("slli t0, t0, " + to_string(shift));
+                        break;
+                    }
+
+                    // 3 * x = (x << 1) + x
+                    if (val == 3) {
+                        genExpr(binary->right.get());
+                        emit("slli t1, t0, 1");
+                        emit("add t0, t1, t0");
+                        break;
+                    }
+
+                    // 5 * x = (x << 2) + x
+                    if (val == 5) {
+                        genExpr(binary->right.get());
+                        emit("slli t1, t0, 2");
+                        emit("add t0, t1, t0");
+                        break;
+                    }
+
+                    // 6 * x = (x << 2) + (x << 1)
+                    if (val == 6) {
+                        genExpr(binary->right.get());
+                        emit("slli t1, t0, 2");
+                        emit("slli t2, t0, 1");
+                        emit("add t0, t1, t2");
+                        break;
+                    }
+
+                    // 7 * x = (x << 3) - x
+                    if (val == 7) {
+                        genExpr(binary->right.get());
+                        emit("slli t1, t0, 3");
+                        emit("sub t0, t1, t0");
+                        break;
+                    }
+
+                    // 9 * x = (x << 3) + x
+                    if (val == 9) {
+                        genExpr(binary->right.get());
+                        emit("slli t1, t0, 3");
+                        emit("add t0, t1, t0");
+                        break;
+                    }
+
+                    // 10 * x = (x << 3) + (x << 1)
+                    if (val == 10) {
+                        genExpr(binary->right.get());
+                        emit("slli t1, t0, 3");
+                        emit("slli t2, t0, 1");
+                        emit("add t0, t1, t2");
+                        break;
+                    }
+
+                    // 15 * x = (x << 4) - x
+                    if (val == 15) {
+                        genExpr(binary->right.get());
+                        emit("slli t1, t0, 4");
+                        emit("sub t0, t1, t0");
+                        break;
+                    }
+                }
+            }
+
+            // ========== 除法优化 ==========
+            if (g_optimize && binary->op == "/" && binary->right->kind == ExprKind::NUMBER) {
+                int val = static_cast<NumberExpr*>(binary->right.get())->value;
+                if (val > 0 && (val & (val - 1)) == 0) {
+                    genExpr(binary->left.get());
+                    int shift = 0;
+                    int tmp = val;
+                    while (tmp > 1) { tmp >>= 1; shift++; }
+
+                    // 有符号除法需要处理负数舍入
+                    if (shift > 0) {
+                        emit("srai t1, t0, 31");                       // 符号位扩展
+                        emit("srli t1, t1, " + to_string(32 - shift)); // 调整值
+                        emit("add t0, t0, t1");                        // 加偏移
+                    }
+                    emit("srai t0, t0, " + to_string(shift));
+                    break;
+                }
+            }
+
+            // ========== 取模优化 ==========
+            if (g_optimize && binary->op == "%" && binary->right->kind == ExprKind::NUMBER) {
+                int val = static_cast<NumberExpr*>(binary->right.get())->value;
+                if (val > 0 && (val & (val - 1)) == 0) {
+                    genExpr(binary->left.get());
+                    // 有符号取模需要特殊处理
+                    // x % n = x - (x / n) * n, 对于2的幂可以简化
+                    // 简化版本：对于非负数，直接用 andi
+                    // 完整版本：需要处理负数情况
+                    emit("srai t1, t0, 31");                       // 符号位
+                    emit("srli t1, t1, " + to_string(32 - (int)log2(val))); // 调整值
+                    emit("add t2, t0, t1");                        // 调整后的被除数
+                    emit("andi t2, t2, " + to_string(~(val - 1))); // 对齐到val的倍数
+                    emit("sub t0, t0, t2");                        // 原值减去对齐值
+                    break;
+                }
+            }
+
             // 普通二元运算
             genExpr(binary->left.get());
             emit("addi sp, sp, -4");
