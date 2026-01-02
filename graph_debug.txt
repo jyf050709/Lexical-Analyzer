@@ -1,6 +1,0 @@
-=== Entering for leafFunc ===
-varUseFreq size: 5
-=== Entering for leafFunc ===
-varUseFreq size: 5
-=== Entering for leafFunc ===
-varUseFreq size: 5

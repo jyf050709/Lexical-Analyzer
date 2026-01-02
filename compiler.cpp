@@ -1250,11 +1250,13 @@ private:
                         // if(true) -> 只保留 then 分支
                         *it = move(ifStmt->thenStmt);
                         changed = true;
+                        continue;  // 重新处理替换后的语句
                     } else {
                         // if(false) -> 只保留 else 分支或删除
                         if (ifStmt->elseStmt) {
                             *it = move(ifStmt->elseStmt);
                             changed = true;
+                            continue;  // 重新处理替换后的语句
                         } else {
                             it = stmts.erase(it);
                             changed = true;
@@ -2904,7 +2906,111 @@ private:
         }
     }
 
-    // 在语句中进行变量重命名
+        // 检查语句是否以 return 结束（用于内联时的控制流重构）
+    bool stmtEndsWithReturn(Stmt* stmt) {
+        if (!stmt) return false;
+        switch (stmt->kind) {
+        case StmtKind::RETURN:
+            return true;
+        case StmtKind::BLOCK: {
+            auto* block = static_cast<BlockStmt*>(stmt);
+            if (block->stmts.empty()) return false;
+            return stmtEndsWithReturn(block->stmts.back().get());
+        }
+        case StmtKind::IF: {
+            auto* i = static_cast<IfStmt*>(stmt);
+            if (!i->elseStmt) return false;
+            return stmtEndsWithReturn(i->thenStmt.get()) && stmtEndsWithReturn(i->elseStmt.get());
+        }
+        default:
+            return false;
+        }
+    }
+
+    // 在语句中进行变量重命名，同时将 return 转换为对结果变量的赋值
+    // 注意：processStmtListForInline 在下方定义，C++类成员函数可以相互调用
+    unique_ptr<Stmt> renameVarsInStmtForInline(Stmt* stmt, map<string, string>& renameMap,
+                                               const string& prefix, const string& resultVar) {
+        if (!stmt) return nullptr;
+        switch (stmt->kind) {
+        case StmtKind::BLOCK: {
+            auto* block = static_cast<BlockStmt*>(stmt);
+            auto newBlock = make_unique<BlockStmt>();
+            processStmtListForInline(newBlock->stmts, block->stmts, 0, renameMap, prefix, resultVar);
+            return newBlock;
+        }
+        case StmtKind::VARDECL: {
+            auto* v = static_cast<VarDeclStmt*>(stmt);
+            string newName = prefix + v->name;
+            renameMap[v->name] = newName;
+            return make_unique<VarDeclStmt>(newName, renameVarsInExpr(v->init.get(), renameMap));
+        }
+        case StmtKind::ASSIGN: {
+            auto* a = static_cast<AssignStmt*>(stmt);
+            string name = renameMap.count(a->name) ? renameMap[a->name] : a->name;
+            return make_unique<AssignStmt>(name, renameVarsInExpr(a->value.get(), renameMap));
+        }
+        case StmtKind::IF: {
+            auto* i = static_cast<IfStmt*>(stmt);
+            auto newIf = make_unique<IfStmt>();
+            newIf->cond = renameVarsInExpr(i->cond.get(), renameMap);
+            newIf->thenStmt = renameVarsInStmtForInline(i->thenStmt.get(), renameMap, prefix, resultVar);
+            if (i->elseStmt) newIf->elseStmt = renameVarsInStmtForInline(i->elseStmt.get(), renameMap, prefix, resultVar);
+            return newIf;
+        }
+        case StmtKind::WHILE: {
+            auto* w = static_cast<WhileStmt*>(stmt);
+            auto newWhile = make_unique<WhileStmt>();
+            newWhile->cond = renameVarsInExpr(w->cond.get(), renameMap);
+            newWhile->body = renameVarsInStmtForInline(w->body.get(), renameMap, prefix, resultVar);
+            return newWhile;
+        }
+        case StmtKind::BREAK:
+            return make_unique<BreakStmt>();
+        case StmtKind::CONTINUE:
+            return make_unique<ContinueStmt>();
+        case StmtKind::RETURN: {
+            auto* r = static_cast<ReturnStmt*>(stmt);
+            if (r->value && !resultVar.empty()) {
+                return make_unique<AssignStmt>(resultVar, renameVarsInExpr(r->value.get(), renameMap));
+            }
+            return make_unique<EmptyStmt>();
+        }
+        case StmtKind::EXPR: {
+            auto* e = static_cast<ExprStmt*>(stmt);
+            return make_unique<ExprStmt>(renameVarsInExpr(e->expr.get(), renameMap));
+        }
+        case StmtKind::EMPTY:
+            return make_unique<EmptyStmt>();
+        }
+        return nullptr;
+    }
+
+    // 处理语句列表，重构控制流以正确处理 return
+    void processStmtListForInline(vector<unique_ptr<Stmt>>& result,
+                                  const vector<unique_ptr<Stmt>>& stmts, size_t start,
+                                  map<string, string>& renameMap, const string& prefix,
+                                  const string& resultVar) {
+        for (size_t i = start; i < stmts.size(); i++) {
+            auto& s = stmts[i];
+            if (s->kind == StmtKind::IF) {
+                auto* ifStmt = static_cast<IfStmt*>(s.get());
+                if (stmtEndsWithReturn(ifStmt->thenStmt.get()) && !ifStmt->elseStmt && i + 1 < stmts.size()) {
+                    auto newIf = make_unique<IfStmt>();
+                    newIf->cond = renameVarsInExpr(ifStmt->cond.get(), renameMap);
+                    newIf->thenStmt = renameVarsInStmtForInline(ifStmt->thenStmt.get(), renameMap, prefix, resultVar);
+                    auto elseBlock = make_unique<BlockStmt>();
+                    processStmtListForInline(elseBlock->stmts, stmts, i + 1, renameMap, prefix, resultVar);
+                    newIf->elseStmt = move(elseBlock);
+                    result.push_back(move(newIf));
+                    return;
+                }
+            }
+            result.push_back(renameVarsInStmtForInline(s.get(), renameMap, prefix, resultVar));
+        }
+    }
+
+    // 在语句中进行变量重命名（保留原函数）
     unique_ptr<Stmt> renameVarsInStmt(Stmt* stmt, map<string, string>& renameMap, const string& prefix) {
         if (!stmt) return nullptr;
         switch (stmt->kind) {
@@ -2984,20 +3090,9 @@ private:
             stmts.push_back(make_unique<VarDeclStmt>(resultVar, make_unique<NumberExpr>(0)));
         }
 
-        // 复制函数体（处理 return）
-        for (auto& s : func->body->stmts) {
-            if (s->kind == StmtKind::RETURN) {
-                auto* ret = static_cast<ReturnStmt*>(s.get());
-                if (ret->value && !func->isVoid) {
-                    // 将 return expr 转换为 result = expr
-                    stmts.push_back(make_unique<AssignStmt>(resultVar,
-                        renameVarsInExpr(ret->value.get(), renameMap)));
-                }
-                // 不生成 return 语句
-            } else {
-                stmts.push_back(renameVarsInStmt(s.get(), renameMap, prefix));
-            }
-        }
+        // 复制函数体，使用新的内联转换函数处理所有 return（包括嵌套的）
+        processStmtListForInline(stmts, func->body->stmts, 0, renameMap, prefix,
+                                 func->isVoid ? "" : resultVar);
 
         return {move(stmts), resultVar};
     }
