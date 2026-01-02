@@ -1430,6 +1430,10 @@ private:
         set<string> modifiedVars;
         collectModifiedVars(whileStmt->body.get(), modifiedVars);
 
+        // 收集循环条件中使用的变量（这些变量的赋值不能被外提）
+        set<string> condVars;
+        collectUsedVars(whileStmt->cond.get(), condVars);
+
         // 先外提循环条件中的不变子表达式（条件每次都会执行，因此安全）
         map<string, string> hoistedExprMap;
         int hoistedExprCount = 0;
@@ -1445,7 +1449,9 @@ private:
                 varDecl->init = hoistInvariantSubexpr(varDecl->init.get(), modifiedVars,
                                                      hoisted, hoistedExprMap, hoistedExprCount);
                 // 如果初始化表达式是循环不变量，且变量在循环中不被再次赋值
-                if (isLoopInvariant(varDecl->init.get(), modifiedVars)) {
+                // 且变量不在循环条件中使用
+                if (isLoopInvariant(varDecl->init.get(), modifiedVars) &&
+                    condVars.find(varDecl->name) == condVars.end()) {
                     // 检查这个变量是否在循环体其他地方被修改
                     set<string> otherMods;
                     for (auto& s : body->stmts) {
@@ -1463,7 +1469,9 @@ private:
                 auto* assign = static_cast<AssignStmt*>(stmt);
                 assign->value = hoistInvariantSubexpr(assign->value.get(), modifiedVars,
                                                      hoisted, hoistedExprMap, hoistedExprCount);
-                if (isLoopInvariant(assign->value.get(), modifiedVars)) {
+                // 如果赋值的右边是循环不变量，且目标变量不在循环条件中使用
+                if (isLoopInvariant(assign->value.get(), modifiedVars) &&
+                    condVars.find(assign->name) == condVars.end()) {
                     set<string> otherMods;
                     for (auto& s : body->stmts) {
                         if (s.get() != stmt) {
