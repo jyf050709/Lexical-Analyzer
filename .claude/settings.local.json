@@ -25,7 +25,8 @@
       "Bash(./compiler_dbg.exe:*)",
       "Bash(./compiler_o1.exe:*)",
       "Bash(tee:*)",
-      "Bash(git checkout:*)"
+      "Bash(git checkout:*)",
+      "Bash(compiler.exe:*)"
     ],
     "deny": [],
     "ask": []
