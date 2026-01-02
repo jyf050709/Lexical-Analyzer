@@ -4376,18 +4376,8 @@ private:
             if (b->op == "+") emit("add " + dstReg + ", " + leftReg + ", " + rightReg);
             else if (b->op == "-") emit("sub " + dstReg + ", " + leftReg + ", " + rightReg);
             else if (b->op == "*") emit("mul " + dstReg + ", " + leftReg + ", " + rightReg);
-            else if (b->op == "/" || b->op == "%") {
-                // 除 0 在 C 语义中是未定义行为；这里约定结果为 0，避免评测中出现不稳定输出/陷入异常。
-                string divZeroLabel = newLabel();
-                string divEndLabel = newLabel();
-                emit("beqz " + rightReg + ", " + divZeroLabel);
-                if (b->op == "/") emit("div " + dstReg + ", " + leftReg + ", " + rightReg);
-                else emit("rem " + dstReg + ", " + leftReg + ", " + rightReg);
-                emit("j " + divEndLabel);
-                emitLabel(divZeroLabel);
-                emit("li " + dstReg + ", 0");
-                emitLabel(divEndLabel);
-            }
+            else if (b->op == "/") emit("div " + dstReg + ", " + leftReg + ", " + rightReg);
+            else if (b->op == "%") emit("rem " + dstReg + ", " + leftReg + ", " + rightReg);
             else if (b->op == "<") emit("slt " + dstReg + ", " + leftReg + ", " + rightReg);
             else if (b->op == ">") emit("slt " + dstReg + ", " + rightReg + ", " + leftReg);
             else if (b->op == "<=") {
@@ -4783,17 +4773,8 @@ private:
                 if (binary->op == "+") emit("add t0, t1, t2");
                 else if (binary->op == "-") emit("sub t0, t1, t2");
                 else if (binary->op == "*") emit("mul t0, t1, t2");
-                else if (binary->op == "/" || binary->op == "%") {
-                    string divZeroLabel = newLabel();
-                    string divEndLabel = newLabel();
-                    emit("beqz t2, " + divZeroLabel);
-                    if (binary->op == "/") emit("div t0, t1, t2");
-                    else emit("rem t0, t1, t2");
-                    emit("j " + divEndLabel);
-                    emitLabel(divZeroLabel);
-                    emit("li t0, 0");
-                    emitLabel(divEndLabel);
-                }
+                else if (binary->op == "/") emit("div t0, t1, t2");
+                else if (binary->op == "%") emit("rem t0, t1, t2");
                 else if (binary->op == "<") emit("slt t0, t1, t2");
                 else if (binary->op == ">") emit("slt t0, t2, t1");
                 else if (binary->op == "<=") {
@@ -4833,17 +4814,8 @@ private:
             if (binary->op == "+") emit("add t0, t0, t1");
             else if (binary->op == "-") emit("sub t0, t0, t1");
             else if (binary->op == "*") emit("mul t0, t0, t1");
-            else if (binary->op == "/" || binary->op == "%") {
-                string divZeroLabel = newLabel();
-                string divEndLabel = newLabel();
-                emit("beqz t1, " + divZeroLabel);
-                if (binary->op == "/") emit("div t0, t0, t1");
-                else emit("rem t0, t0, t1");
-                emit("j " + divEndLabel);
-                emitLabel(divZeroLabel);
-                emit("li t0, 0");
-                emitLabel(divEndLabel);
-            }
+            else if (binary->op == "/") emit("div t0, t0, t1");
+            else if (binary->op == "%") emit("rem t0, t0, t1");
             else if (binary->op == "<") emit("slt t0, t0, t1");
             else if (binary->op == ">") emit("slt t0, t1, t0");
             else if (binary->op == "<=") { emit("slt t0, t1, t0"); emit("xori t0, t0, 1"); }
