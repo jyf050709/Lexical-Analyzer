@@ -1109,54 +1109,36 @@ private:
     }
 
     // 完整的尾递归优化：将尾递归函数转换为循环
+    // 原理：将 return f(new_args) 转换为 args = new_args; continue;
     void optimizeTailRecursionComplete(FuncDef* func) {
         if (!canOptimizeTailRecursion(func)) return;
 
         auto& stmts = func->body->stmts;
+        if (stmts.empty()) return;
 
-        // 创建新的函数体结构
-        // 1. 将参数复制到局部变量（用于循环内修改）
-        auto newBody = make_unique<BlockStmt>();
-
-        for (size_t i = 0; i < currentParams.size(); i++) {
-            // 创建参数的本地副本
-            string localName = "__param_" + currentParams[i];
-            newBody->stmts.push_back(make_unique<VarDeclStmt>(
-                localName, make_unique<IdentExpr>(currentParams[i])));
-        }
-
-        // 2. 创建 while(1) 循环
+        // 创建 while(1) 循环
         auto whileStmt = make_unique<WhileStmt>();
         whileStmt->cond = make_unique<NumberExpr>(1);
 
-        // 3. 循环体：原来的函数体
+        // 循环体：克隆原来的函数体
         auto loopBody = make_unique<BlockStmt>();
-
-        // 将原来的参数引用替换为本地副本
-        // 首先，克隆原来的语句
         for (auto& s : stmts) {
-            loopBody->stmts.push_back(cloneStmt(s.get()));
+            auto cloned = cloneStmt(s.get());
+            if (cloned) {
+                loopBody->stmts.push_back(move(cloned));
+            }
         }
 
-        // 4. 将本地参数名映射到原参数名
-        map<string, string> paramRename;
-        for (const auto& p : currentParams) {
-            paramRename["__param_" + p] = p;
-        }
-
-        // 5. 转换尾递归调用为参数赋值 + continue
+        // 转换尾递归调用为参数赋值 + continue
         for (auto& s : loopBody->stmts) {
             transformTailCallsInStmt(s);
         }
 
         whileStmt->body = move(loopBody);
-        newBody->stmts.push_back(move(whileStmt));
 
-        // 替换函数体
+        // 替换函数体为单个 while 循环
         stmts.clear();
-        for (auto& s : newBody->stmts) {
-            stmts.push_back(move(s));
-        }
+        stmts.push_back(move(whileStmt));
     }
 
     // 优化语句列表，返回是否有修改
@@ -1670,6 +1652,70 @@ private:
                 auto* w = static_cast<WhileStmt*>(stmt.get());
                 if (w->body->kind == StmtKind::BLOCK) {
                     if (eliminateDeadVars(static_cast<BlockStmt*>(w->body.get())->stmts))
+                        changed = true;
+                }
+            }
+        }
+
+        return changed;
+    }
+
+    // 死变量消除（排除指定变量）- 用于尾递归优化后保护循环变量
+    bool eliminateDeadVarsExcept(vector<unique_ptr<Stmt>>& stmts, const set<string>& protectedVars) {
+        bool changed = false;
+
+        // 收集所有使用的变量
+        set<string> usedVars;
+        for (auto& stmt : stmts) {
+            collectUsedVarsInStmt(stmt.get(), usedVars);
+        }
+
+        // 将受保护的变量加入使用集合
+        for (const auto& v : protectedVars) {
+            usedVars.insert(v);
+        }
+
+        // 删除未使用变量的声明和赋值
+        for (auto it = stmts.begin(); it != stmts.end(); ) {
+            if ((*it)->kind == StmtKind::VARDECL) {
+                auto* v = static_cast<VarDeclStmt*>(it->get());
+                if (usedVars.find(v->name) == usedVars.end() &&
+                    !hasCallExpr(v->init.get())) {
+                    it = stmts.erase(it);
+                    changed = true;
+                    continue;
+                }
+            } else if ((*it)->kind == StmtKind::ASSIGN) {
+                auto* a = static_cast<AssignStmt*>(it->get());
+                if (usedVars.find(a->name) == usedVars.end() &&
+                    !hasCallExpr(a->value.get())) {
+                    it = stmts.erase(it);
+                    changed = true;
+                    continue;
+                }
+            }
+            ++it;
+        }
+
+        // 递归处理嵌套块（传递受保护变量）
+        for (auto& stmt : stmts) {
+            if (stmt->kind == StmtKind::BLOCK) {
+                if (eliminateDeadVarsExcept(static_cast<BlockStmt*>(stmt.get())->stmts, protectedVars))
+                    changed = true;
+            } else if (stmt->kind == StmtKind::IF) {
+                auto* i = static_cast<IfStmt*>(stmt.get());
+                if (i->thenStmt->kind == StmtKind::BLOCK) {
+                    if (eliminateDeadVarsExcept(static_cast<BlockStmt*>(i->thenStmt.get())->stmts, protectedVars))
+                        changed = true;
+                }
+                if (i->elseStmt && i->elseStmt->kind == StmtKind::BLOCK) {
+                    if (eliminateDeadVarsExcept(static_cast<BlockStmt*>(i->elseStmt.get())->stmts, protectedVars))
+                        changed = true;
+                }
+            } else if (stmt->kind == StmtKind::WHILE) {
+                auto* w = static_cast<WhileStmt*>(stmt.get());
+                if (w->body->kind == StmtKind::BLOCK) {
+                    if (eliminateDeadVarsExcept(static_cast<BlockStmt*>(w->body.get())->stmts, protectedVars))
                         changed = true;
                 }
             }
@@ -3008,31 +3054,36 @@ public:
             cseStmtList(func->body->stmts);
         }
 
-        // 第五阶段：尾递归优化（AST级别 - 暂时禁用，使用代码生成器级别的尾调用优化）
-        // 注意：AST级别和代码生成器级别的尾递归优化是两种不同方法，暂时只用后者
-        // for (auto& func : prog->functions) {
-        //     tailRecursionId = 0;  // 重置尾递归 ID
-        //     optimizeTailRecursionComplete(func.get());
-        // }
-        //
-        // // 尾递归优化后运行基础优化（处理新生成的循环代码）
-        // for (int round = 0; round < 5; round++) {
-        //     bool changed = false;
-        //     for (auto& func : prog->functions) {
-        //         constVars.clear();
-        //         copyVars.clear();
-        //         if (optimizeStmtList(func->body->stmts)) {
-        //             changed = true;
-        //         }
-        //     }
-        //     if (!changed) break;
-        // }
+        // 第五阶段：尾递归优化（AST级别 - 将尾递归转换为循环）
+        for (auto& func : prog->functions) {
+            tailRecursionId = 0;
+            optimizeTailRecursionComplete(func.get());
+        }
 
-        // 第六阶段：死变量消除
+        // 尾递归优化后运行基础优化（处理新生成的循环代码）
+        for (int round = 0; round < 5; round++) {
+            bool changed = false;
+            for (auto& func : prog->functions) {
+                constVars.clear();
+                copyVars.clear();
+                if (optimizeStmtList(func->body->stmts)) {
+                    changed = true;
+                }
+            }
+            if (!changed) break;
+        }
+
+        // 第六阶段：死变量消除（对尾递归转换后的代码需特殊处理）
+        // 注意：循环变量不应被视为死变量
         for (int round = 0; round < 3; round++) {
             bool changed = false;
             for (auto& func : prog->functions) {
-                if (eliminateDeadVars(func->body->stmts)) {
+                // 收集函数参数名，这些在尾递归优化后不应被删除
+                set<string> loopVars;
+                for (auto& p : func->params) {
+                    if (p) loopVars.insert(p->name);
+                }
+                if (eliminateDeadVarsExcept(func->body->stmts, loopVars)) {
                     changed = true;
                 }
             }
