@@ -10,6 +10,7 @@
 #include <cmath>
 #include <tuple>
 #include <algorithm>
+#include <climits>
 
 using namespace std;
 
@@ -426,7 +427,12 @@ private:
     }
 
     unique_ptr<Expr> parsePrimary() {
-        if (match(TokenType::INT_CONST)) return make_unique<NumberExpr>(stoi(previous().value));
+        if (match(TokenType::INT_CONST)) {
+            // 使用 stoll 解析，然后截断为 int，以正确处理像 2147483648 这样的值
+            // 这对于表达式 -2147483648 很重要（解析为 -(2147483648)）
+            long long val = stoll(previous().value);
+            return make_unique<NumberExpr>(static_cast<int>(val));
+        }
         if (match(TokenType::LPAREN)) {
             auto expr = parseExpr();
             consume(TokenType::RPAREN);
@@ -725,11 +731,15 @@ private:
                 int r = static_cast<NumberExpr*>(right.get())->value;
                 int result = 0;
 
+                // 检查除法溢出：INT_MIN / -1 会溢出，跳过常量折叠
+                bool divOverflow = (binary->op == "/" || binary->op == "%") &&
+                                   l == INT_MIN && r == -1;
+
                 if (binary->op == "+") result = l + r;
                 else if (binary->op == "-") result = l - r;
                 else if (binary->op == "*") result = l * r;
-                else if (binary->op == "/" && r != 0) result = l / r;
-                else if (binary->op == "%" && r != 0) result = l % r;
+                else if (binary->op == "/" && r != 0 && !divOverflow) result = l / r;
+                else if (binary->op == "%" && r != 0 && !divOverflow) result = l % r;
                 else if (binary->op == "<") result = l < r ? 1 : 0;
                 else if (binary->op == ">") result = l > r ? 1 : 0;
                 else if (binary->op == "<=") result = l <= r ? 1 : 0;
@@ -790,25 +800,13 @@ private:
                 // x / -1 = -x
                 if (right->kind == ExprKind::NUMBER && getConstValue(right.get()) == -1)
                     return make_unique<UnaryExpr>("-", move(left));
-                // x / x = 1 (assuming x != 0)
-                if (left->kind == ExprKind::IDENT && right->kind == ExprKind::IDENT &&
-                    static_cast<IdentExpr*>(left.get())->name == static_cast<IdentExpr*>(right.get())->name)
-                    return make_unique<NumberExpr>(1);
-                // 0 / x = 0 (assuming x != 0)
-                if (left->kind == ExprKind::NUMBER && getConstValue(left.get()) == 0)
-                    return make_unique<NumberExpr>(0);
+                // 注意：移除了 x/x=1 和 0/x=0 优化，因为当 x=0 时会产生错误结果
             }
             if (binary->op == "%") {
                 // x % 1 = 0
                 if (right->kind == ExprKind::NUMBER && getConstValue(right.get()) == 1)
                     return make_unique<NumberExpr>(0);
-                // x % x = 0 (assuming x != 0)
-                if (left->kind == ExprKind::IDENT && right->kind == ExprKind::IDENT &&
-                    static_cast<IdentExpr*>(left.get())->name == static_cast<IdentExpr*>(right.get())->name)
-                    return make_unique<NumberExpr>(0);
-                // 0 % x = 0
-                if (left->kind == ExprKind::NUMBER && getConstValue(left.get()) == 0)
-                    return make_unique<NumberExpr>(0);
+                // 注意：移除了 x%x=0 和 0%x=0 优化，因为当 x=0 时会产生错误结果
             }
             // 比较优化
             if (binary->op == "<" || binary->op == ">") {
@@ -2274,10 +2272,15 @@ private:
 
         if (info.step == 0) return info;
 
+        // 修复：只处理正步长的情况（负步长的 i < N 循环要么不执行，要么无限循环）
+        if (info.step < 0) return info;
+
         // 计算迭代次数
         int endVal = info.isLessThan ? info.boundVal : info.boundVal + 1;
+        // 如果 initVal >= endVal，循环不执行
+        if (info.initVal >= endVal) return info;
+
         int iters = (endVal - info.initVal + info.step - 1) / info.step;
-        if (iters < 0) iters = 0;
 
         // 检查是否包含break/continue
         if (loopHasBreakContinue(whileStmt->body.get())) return info;
@@ -2291,8 +2294,13 @@ private:
         auto* whileStmt = static_cast<WhileStmt*>(stmts[whileIdx].get());
         auto* body = static_cast<BlockStmt*>(whileStmt->body.get());
 
+        // 修复：只处理正步长的情况
+        if (info.step <= 0) return false;
+
         int endVal = info.isLessThan ? info.boundVal : info.boundVal + 1;
-        int iters = (endVal - info.initVal) / info.step;
+        // 修复：使用与 analyzeLoop 一致的向上取整公式
+        int iters = (endVal - info.initVal + info.step - 1) / info.step;
+        if (iters <= 0) return false;
 
         // 检查展开后语句数是否过多
         int bodySize = countStmtsInBody(whileStmt->body.get());
@@ -3121,6 +3129,7 @@ private:
     string currentFuncName;             // 当前函数名（用于检测尾递归）
     string funcEntryLabel;              // 函数入口标签（用于尾调用跳转）
     int currentParamCount = 0;          // 当前函数参数数量
+    vector<string> currentParamNames;   // 参数名（按索引）
     bool tailCallOptEnabled = true;     // 尾调用优化开关
 
     // 局部变量寄存器化：变量名 -> 寄存器名
@@ -4062,13 +4071,7 @@ private:
             int paramIdx;
             int offset = lookupVar(ident->name, paramIdx);
             if (paramIdx >= 0) {
-                int sRegSaveCount = usedSRegs.size();
-                int paramStartOffset = -8 - sRegSaveCount * 4;
-                if (paramIdx < 8) {
-                    emit("lw " + r + ", " + to_string(paramStartOffset - 4 - paramIdx * 4) + "(s0)");
-                } else {
-                    emit("lw " + r + ", " + to_string((paramIdx - 8) * 4) + "(s0)");
-                }
+                emit("lw " + r + ", " + to_string(paramSlotOffset(paramIdx)) + "(s0)");
             } else {
                 emit("lw " + r + ", " + to_string(offset) + "(s0)");
             }
@@ -4169,7 +4172,13 @@ private:
         return stackOffset;
     }
 
-    // 查找变量的栈偏移，如果是参数返回-1并设置paramIdx
+    int paramSlotOffset(int paramIdx) const {
+        int sRegSaveCount = (int)usedSRegs.size();
+        int paramStartOffset = -8 - sRegSaveCount * 4;
+        return paramStartOffset - 4 - paramIdx * 4;
+    }
+
+    // 查找变量的栈偏移，如果是参数设置 paramIdx
     int lookupVar(const string& name, int& paramIdx) {
         // 先查找局部变量
         for (int i = varScopes.size() - 1; i >= 0; i--) {
@@ -4207,14 +4216,7 @@ private:
             int paramIdx;
             int offset = lookupVar(ident->name, paramIdx);
             if (paramIdx >= 0) {
-                // 参数偏移需要考虑 sRegs
-                int sRegSaveCount = usedSRegs.size();
-                int paramStartOffset = -8 - sRegSaveCount * 4;
-                if (paramIdx < 8) {
-                    emit("lw " + targetReg + ", " + to_string(paramStartOffset - 4 - paramIdx * 4) + "(s0)");
-                } else {
-                    emit("lw " + targetReg + ", " + to_string((paramIdx - 8) * 4) + "(s0)");
-                }
+                emit("lw " + targetReg + ", " + to_string(paramSlotOffset(paramIdx)) + "(s0)");
             } else {
                 emit("lw " + targetReg + ", " + to_string(offset) + "(s0)");
             }
@@ -4250,14 +4252,7 @@ private:
             int paramIdx;
             int offset = lookupVar(ident->name, paramIdx);
             if (paramIdx >= 0) {
-                // 参数偏移需要考虑 sRegs
-                int sRegSaveCount = usedSRegs.size();
-                int paramStartOffset = -8 - sRegSaveCount * 4;
-                if (paramIdx < 8) {
-                    emit("lw t0, " + to_string(paramStartOffset - 4 - paramIdx * 4) + "(s0)");
-                } else {
-                    emit("lw t0, " + to_string((paramIdx - 8) * 4) + "(s0)");
-                }
+                emit("lw t0, " + to_string(paramSlotOffset(paramIdx)) + "(s0)");
             } else {
                 emit("lw t0, " + to_string(offset) + "(s0)");
             }
@@ -4695,14 +4690,7 @@ private:
             int paramIdx;
             int offset = lookupVar(assign->name, paramIdx);
             if (paramIdx >= 0) {
-                // 参数偏移需要考虑 sRegs
-                int sRegSaveCount = usedSRegs.size();
-                int paramStartOffset = -8 - sRegSaveCount * 4;
-                if (paramIdx < 8) {
-                    emit("sw t0, " + to_string(paramStartOffset - 4 - paramIdx * 4) + "(s0)");
-                } else {
-                    emit("sw t0, " + to_string((paramIdx - 8) * 4) + "(s0)");
-                }
+                emit("sw t0, " + to_string(paramSlotOffset(paramIdx)) + "(s0)");
             } else {
                 emit("sw t0, " + to_string(offset) + "(s0)");
             }
