@@ -3072,6 +3072,12 @@ private:
     bool currentFuncIsLeaf = true;      // 当前函数是否为叶函数（无call）
     int spDeltaBytes = 0;               // 当前sp相对于prologue后的偏移（用于16B对齐）
 
+    // ========== 尾调用优化 ==========
+    string currentFuncName;             // 当前函数名（用于检测尾递归）
+    string funcEntryLabel;              // 函数入口标签（用于尾调用跳转）
+    int currentParamCount = 0;          // 当前函数参数数量
+    bool tailCallOptEnabled = true;     // 尾调用优化开关
+
     // 局部变量寄存器化：变量名 -> 寄存器名
     map<string, string> varToReg;
     // 已使用的 callee-saved 寄存器
@@ -4539,6 +4545,11 @@ private:
         varScopes.clear();
         varScopes.push_back({});  // 函数作用域
         spDeltaBytes = 0;
+
+        // 设置尾调用优化信息
+        currentFuncName = func->name;
+        currentParamCount = func->params.size();
+        funcEntryLabel = "__tail_entry_" + func->name;
 
         // 计算需要的栈空间
         int paramCount = func->params.size();
