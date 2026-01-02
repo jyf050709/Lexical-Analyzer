@@ -5536,9 +5536,7 @@ int main(int argc, char* argv[]) {
     // 解析命令行参数
     for (int i = 1; i < argc; i++) {
         if (string(argv[i]) == "-opt") {
-            // 评测以正确性为先：当前优化（尤其是寄存器分配/窥孔等）仍可能引入语义偏差。
-            // 因此这里接受 -opt 但不启用优化，避免“错误输出”。
-            g_optimize = false;
+            g_optimize = true;
         }
     }
 
