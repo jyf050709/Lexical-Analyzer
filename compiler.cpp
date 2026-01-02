@@ -1769,6 +1769,7 @@ private:
 
     // 克隆语句
     unique_ptr<Stmt> cloneStmt(Stmt* stmt) {
+        if (!stmt) return nullptr;
         switch (stmt->kind) {
         case StmtKind::BLOCK: {
             auto* block = static_cast<BlockStmt*>(stmt);
@@ -1864,6 +1865,7 @@ private:
 
     // 替换语句中的变量为常量值（用于完全展开）
     unique_ptr<Stmt> substituteVarInStmt(Stmt* stmt, const string& varName, int value, bool skipInductionUpdate) {
+        if (!stmt) return nullptr;
         switch (stmt->kind) {
         case StmtKind::BLOCK: {
             auto* block = static_cast<BlockStmt*>(stmt);
