@@ -2632,7 +2632,6 @@ public:
             }
             if (!changed) break;
         }
-        // 测试完成，继续后续优化
 
         // 函数内联阶段
         inlineFunctions(prog);
