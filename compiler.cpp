@@ -936,6 +936,16 @@ private:
             }
             case StmtKind::WHILE: {
                 auto* whileStmt = static_cast<WhileStmt*>(stmt);
+
+                // 先收集循环体内修改的变量，从常量表中移除
+                set<string> modifiedInLoop;
+                collectModifiedVars(whileStmt->body.get(), modifiedInLoop);
+                for (const auto& var : modifiedInLoop) {
+                    constVars.erase(var);
+                    copyVars.erase(var);
+                }
+
+                // 现在再折叠条件
                 whileStmt->cond = foldExpr(whileStmt->cond.get());
 
                 // while(0) 消除
@@ -946,7 +956,7 @@ private:
                     continue;
                 }
 
-                // 循环内的优化（保守：清除循环体可能修改的变量）
+                // 循环内的优化（保守：清除所有常量信息）
                 constVars.clear();
                 copyVars.clear();
                 if (whileStmt->body->kind == StmtKind::BLOCK) {
@@ -1382,6 +1392,287 @@ private:
         return changed;
     }
 
+    // 归纳变量强度削减：将 i * c 转换为增量加法
+    struct InductionVar {
+        string varName;      // 归纳变量名
+        int step;            // 步长
+    };
+
+    // 检测归纳变量：形如 i = i + c 的变量
+    void detectInductionVars(Stmt* stmt, map<string, int>& inductionVars) {
+        switch (stmt->kind) {
+        case StmtKind::BLOCK: {
+            auto* block = static_cast<BlockStmt*>(stmt);
+            for (auto& s : block->stmts) detectInductionVars(s.get(), inductionVars);
+            break;
+        }
+        case StmtKind::ASSIGN: {
+            auto* assign = static_cast<AssignStmt*>(stmt);
+            // 检查是否是 i = i + c 或 i = i - c 的形式
+            if (assign->value->kind == ExprKind::BINARY) {
+                auto* binary = static_cast<BinaryExpr*>(assign->value.get());
+                if ((binary->op == "+" || binary->op == "-") &&
+                    binary->left->kind == ExprKind::IDENT &&
+                    binary->right->kind == ExprKind::NUMBER) {
+                    auto* ident = static_cast<IdentExpr*>(binary->left.get());
+                    if (ident->name == assign->name) {
+                        int step = static_cast<NumberExpr*>(binary->right.get())->value;
+                        if (binary->op == "-") step = -step;
+                        inductionVars[assign->name] = step;
+                    }
+                }
+            }
+            break;
+        }
+        case StmtKind::IF: {
+            auto* i = static_cast<IfStmt*>(stmt);
+            detectInductionVars(i->thenStmt.get(), inductionVars);
+            if (i->elseStmt) detectInductionVars(i->elseStmt.get(), inductionVars);
+            break;
+        }
+        case StmtKind::WHILE: {
+            auto* w = static_cast<WhileStmt*>(stmt);
+            detectInductionVars(w->body.get(), inductionVars);
+            break;
+        }
+        default:
+            break;
+        }
+    }
+
+    // 检查表达式是否是 inductionVar * constant 的形式
+    bool isInductionMul(Expr* expr, const map<string, int>& inductionVars,
+                        string& varName, int& multiplier) {
+        if (expr->kind != ExprKind::BINARY) return false;
+        auto* binary = static_cast<BinaryExpr*>(expr);
+        if (binary->op != "*") return false;
+
+        // 检查 var * const 形式
+        if (binary->left->kind == ExprKind::IDENT &&
+            binary->right->kind == ExprKind::NUMBER) {
+            auto* ident = static_cast<IdentExpr*>(binary->left.get());
+            if (inductionVars.count(ident->name)) {
+                varName = ident->name;
+                multiplier = static_cast<NumberExpr*>(binary->right.get())->value;
+                return true;
+            }
+        }
+        // 检查 const * var 形式
+        if (binary->left->kind == ExprKind::NUMBER &&
+            binary->right->kind == ExprKind::IDENT) {
+            auto* ident = static_cast<IdentExpr*>(binary->right.get());
+            if (inductionVars.count(ident->name)) {
+                varName = ident->name;
+                multiplier = static_cast<NumberExpr*>(binary->left.get())->value;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // 在表达式中进行强度削减替换
+    int strengthReductionCount = 0;
+    map<string, string> strengthReductionMap;  // "i*4" -> "__sr_0"
+
+    unique_ptr<Expr> applyStrengthReduction(Expr* expr, const map<string, int>& inductionVars,
+                                            vector<unique_ptr<Stmt>>& preLoop,
+                                            vector<unique_ptr<Stmt>>& inLoop,
+                                            const map<string, int>& initVals) {
+        switch (expr->kind) {
+        case ExprKind::NUMBER:
+            return make_unique<NumberExpr>(static_cast<NumberExpr*>(expr)->value);
+        case ExprKind::IDENT:
+            return make_unique<IdentExpr>(static_cast<IdentExpr*>(expr)->name);
+        case ExprKind::UNARY: {
+            auto* u = static_cast<UnaryExpr*>(expr);
+            return make_unique<UnaryExpr>(u->op,
+                applyStrengthReduction(u->operand.get(), inductionVars, preLoop, inLoop, initVals));
+        }
+        case ExprKind::BINARY: {
+            auto* binary = static_cast<BinaryExpr*>(expr);
+            string varName;
+            int multiplier;
+
+            // 检查是否可以进行强度削减
+            if (isInductionMul(expr, inductionVars, varName, multiplier)) {
+                string key = varName + "*" + to_string(multiplier);
+
+                if (!strengthReductionMap.count(key)) {
+                    // 创建新的辅助变量
+                    string newVar = "__sr_" + to_string(strengthReductionCount++);
+                    strengthReductionMap[key] = newVar;
+
+                    // 计算初始值：init_i * multiplier
+                    int initVal = initVals.count(varName) ? initVals.at(varName) : 0;
+                    preLoop.push_back(make_unique<VarDeclStmt>(newVar,
+                        make_unique<NumberExpr>(initVal * multiplier)));
+
+                    // 添加循环内的增量：newVar = newVar + step * multiplier
+                    int step = inductionVars.at(varName);
+                    int increment = step * multiplier;
+                    inLoop.push_back(make_unique<AssignStmt>(newVar,
+                        make_unique<BinaryExpr>("+",
+                            make_unique<IdentExpr>(newVar),
+                            make_unique<NumberExpr>(increment))));
+                }
+
+                return make_unique<IdentExpr>(strengthReductionMap[key]);
+            }
+
+            // 递归处理子表达式
+            return make_unique<BinaryExpr>(binary->op,
+                applyStrengthReduction(binary->left.get(), inductionVars, preLoop, inLoop, initVals),
+                applyStrengthReduction(binary->right.get(), inductionVars, preLoop, inLoop, initVals));
+        }
+        case ExprKind::CALL: {
+            auto* c = static_cast<CallExpr*>(expr);
+            auto newCall = make_unique<CallExpr>(c->funcName);
+            for (auto& arg : c->args) {
+                newCall->args.push_back(
+                    applyStrengthReduction(arg.get(), inductionVars, preLoop, inLoop, initVals));
+            }
+            return newCall;
+        }
+        }
+        return nullptr;
+    }
+
+    // 对语句应用强度削减
+    void applyStrengthReductionToStmt(Stmt* stmt, const map<string, int>& inductionVars,
+                                      vector<unique_ptr<Stmt>>& preLoop,
+                                      vector<unique_ptr<Stmt>>& inLoop,
+                                      const map<string, int>& initVals) {
+        switch (stmt->kind) {
+        case StmtKind::BLOCK: {
+            auto* block = static_cast<BlockStmt*>(stmt);
+            for (auto& s : block->stmts) {
+                applyStrengthReductionToStmt(s.get(), inductionVars, preLoop, inLoop, initVals);
+            }
+            break;
+        }
+        case StmtKind::VARDECL: {
+            auto* v = static_cast<VarDeclStmt*>(stmt);
+            v->init = applyStrengthReduction(v->init.get(), inductionVars, preLoop, inLoop, initVals);
+            break;
+        }
+        case StmtKind::ASSIGN: {
+            auto* a = static_cast<AssignStmt*>(stmt);
+            // 不处理归纳变量自身的赋值
+            if (!inductionVars.count(a->name)) {
+                a->value = applyStrengthReduction(a->value.get(), inductionVars, preLoop, inLoop, initVals);
+            }
+            break;
+        }
+        case StmtKind::IF: {
+            auto* i = static_cast<IfStmt*>(stmt);
+            i->cond = applyStrengthReduction(i->cond.get(), inductionVars, preLoop, inLoop, initVals);
+            applyStrengthReductionToStmt(i->thenStmt.get(), inductionVars, preLoop, inLoop, initVals);
+            if (i->elseStmt) {
+                applyStrengthReductionToStmt(i->elseStmt.get(), inductionVars, preLoop, inLoop, initVals);
+            }
+            break;
+        }
+        case StmtKind::RETURN: {
+            auto* r = static_cast<ReturnStmt*>(stmt);
+            if (r->value) {
+                r->value = applyStrengthReduction(r->value.get(), inductionVars, preLoop, inLoop, initVals);
+            }
+            break;
+        }
+        case StmtKind::EXPR: {
+            auto* e = static_cast<ExprStmt*>(stmt);
+            e->expr = applyStrengthReduction(e->expr.get(), inductionVars, preLoop, inLoop, initVals);
+            break;
+        }
+        default:
+            break;
+        }
+    }
+
+    // 对循环进行归纳变量强度削减
+    void optimizeLoopStrengthReduction(vector<unique_ptr<Stmt>>& stmts) {
+        for (size_t i = 0; i < stmts.size(); i++) {
+            if (stmts[i]->kind == StmtKind::WHILE) {
+                auto* whileStmt = static_cast<WhileStmt*>(stmts[i].get());
+
+                // 检测归纳变量
+                map<string, int> inductionVars;
+                detectInductionVars(whileStmt->body.get(), inductionVars);
+
+                if (inductionVars.empty()) continue;
+
+                // 收集归纳变量的初始值（从循环前的语句中）
+                map<string, int> initVals;
+                for (size_t j = 0; j < i; j++) {
+                    if (stmts[j]->kind == StmtKind::VARDECL) {
+                        auto* v = static_cast<VarDeclStmt*>(stmts[j].get());
+                        if (inductionVars.count(v->name) && v->init->kind == ExprKind::NUMBER) {
+                            initVals[v->name] = static_cast<NumberExpr*>(v->init.get())->value;
+                        }
+                    } else if (stmts[j]->kind == StmtKind::ASSIGN) {
+                        auto* a = static_cast<AssignStmt*>(stmts[j].get());
+                        if (inductionVars.count(a->name) && a->value->kind == ExprKind::NUMBER) {
+                            initVals[a->name] = static_cast<NumberExpr*>(a->value.get())->value;
+                        }
+                    }
+                }
+
+                // 重置强度削减状态
+                strengthReductionMap.clear();
+
+                // 存储需要添加的语句
+                vector<unique_ptr<Stmt>> preLoop;
+                vector<unique_ptr<Stmt>> inLoopEnd;
+
+                // 应用强度削减
+                if (whileStmt->body->kind == StmtKind::BLOCK) {
+                    auto* body = static_cast<BlockStmt*>(whileStmt->body.get());
+                    for (auto& s : body->stmts) {
+                        applyStrengthReductionToStmt(s.get(), inductionVars, preLoop, inLoopEnd, initVals);
+                    }
+
+                    // 将增量语句添加到循环体末尾（在归纳变量更新之前）
+                    for (auto& s : inLoopEnd) {
+                        // 找到归纳变量更新的位置，在其前面插入
+                        bool inserted = false;
+                        for (size_t k = body->stmts.size(); k > 0; k--) {
+                            if (body->stmts[k-1]->kind == StmtKind::ASSIGN) {
+                                auto* assign = static_cast<AssignStmt*>(body->stmts[k-1].get());
+                                if (inductionVars.count(assign->name)) {
+                                    body->stmts.insert(body->stmts.begin() + k - 1, move(s));
+                                    inserted = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if (!inserted) {
+                            body->stmts.push_back(move(s));
+                        }
+                    }
+                }
+
+                // 在循环前插入初始化语句
+                for (auto it = preLoop.rbegin(); it != preLoop.rend(); ++it) {
+                    stmts.insert(stmts.begin() + i, move(*it));
+                    i++;
+                }
+            }
+
+            // 递归处理嵌套结构
+            if (stmts[i]->kind == StmtKind::IF) {
+                auto* ifStmt = static_cast<IfStmt*>(stmts[i].get());
+                if (ifStmt->thenStmt->kind == StmtKind::BLOCK) {
+                    optimizeLoopStrengthReduction(static_cast<BlockStmt*>(ifStmt->thenStmt.get())->stmts);
+                }
+                if (ifStmt->elseStmt && ifStmt->elseStmt->kind == StmtKind::BLOCK) {
+                    optimizeLoopStrengthReduction(static_cast<BlockStmt*>(ifStmt->elseStmt.get())->stmts);
+                }
+            } else if (stmts[i]->kind == StmtKind::BLOCK) {
+                optimizeLoopStrengthReduction(static_cast<BlockStmt*>(stmts[i].get())->stmts);
+            }
+        }
+    }
+
 public:
     void optimize(Program* prog) {
         // 第一阶段：多轮基础优化
@@ -1418,19 +1709,25 @@ public:
             }
         }
 
-        // 第三阶段：公共子表达式消除
+        // 第三阶段：归纳变量强度削减
+        for (auto& func : prog->functions) {
+            strengthReductionCount = 0;
+            optimizeLoopStrengthReduction(func->body->stmts);
+        }
+
+        // 第四阶段：公共子表达式消除
         for (auto& func : prog->functions) {
             cseMap.clear();
             cseTempCount = 0;
             cseStmtList(func->body->stmts);
         }
 
-        // 第四阶段：尾递归优化
+        // 第五阶段：尾递归优化
         for (auto& func : prog->functions) {
             optimizeTailRecursion(func.get());
         }
 
-        // 第五阶段：死变量消除
+        // 第六阶段：死变量消除
         for (int round = 0; round < 3; round++) {
             bool changed = false;
             for (auto& func : prog->functions) {
