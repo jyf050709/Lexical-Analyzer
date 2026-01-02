@@ -1118,6 +1118,7 @@ private:
 
     // 收集循环内被修改的变量
     void collectModifiedVars(Stmt* stmt, set<string>& modified) {
+        if (!stmt) return;
         switch (stmt->kind) {
         case StmtKind::BLOCK: {
             auto* block = static_cast<BlockStmt*>(stmt);
