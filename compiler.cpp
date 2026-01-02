@@ -474,11 +474,13 @@ private:
 
     // 检查表达式是否为常量
     bool isConstExpr(Expr* expr) {
+        if (!expr) return false;
         return expr->kind == ExprKind::NUMBER;
     }
 
     // 获取常量值
     int getConstValue(Expr* expr) {
+        if (!expr) return 0;
         return static_cast<NumberExpr*>(expr)->value;
     }
 
@@ -496,6 +498,7 @@ private:
 
     // 深拷贝表达式
     unique_ptr<Expr> cloneExpr(Expr* expr) {
+        if (!expr) return nullptr;
         switch (expr->kind) {
         case ExprKind::NUMBER:
             return make_unique<NumberExpr>(static_cast<NumberExpr*>(expr)->value);
@@ -523,6 +526,7 @@ private:
 
     // 表达式转字符串（用于公共子表达式消除）
     string exprToString(Expr* expr) {
+        if (!expr) return "";
         switch (expr->kind) {
         case ExprKind::NUMBER:
             return to_string(static_cast<NumberExpr*>(expr)->value);
@@ -551,6 +555,7 @@ private:
 
     // 检查表达式是否使用了某个变量
     bool exprUsesVar(Expr* expr, const string& var) {
+        if (!expr) return false;
         switch (expr->kind) {
         case ExprKind::NUMBER:
             return false;
@@ -575,6 +580,7 @@ private:
 
     // 检查表达式是否包含函数调用（有副作用）
     bool hasCallExpr(Expr* expr) {
+        if (!expr) return false;
         switch (expr->kind) {
         case ExprKind::NUMBER:
         case ExprKind::IDENT:
@@ -593,6 +599,7 @@ private:
 
     // 统计变量使用
     void countVarUse(Expr* expr) {
+        if (!expr) return;
         switch (expr->kind) {
         case ExprKind::IDENT:
             varUseCount[static_cast<IdentExpr*>(expr)->name]++;
@@ -663,6 +670,7 @@ private:
 
     // 常量折叠 + 常量传播 + 复制传播 + 代数简化 + 强度削减
     unique_ptr<Expr> foldExpr(Expr* expr) {
+        if (!expr) return nullptr;
         switch (expr->kind) {
         case ExprKind::NUMBER:
             return make_unique<NumberExpr>(static_cast<NumberExpr*>(expr)->value);
@@ -1333,6 +1341,7 @@ private:
 
     // 死变量消除：收集所有被使用的变量
     void collectUsedVars(Expr* expr, set<string>& used) {
+        if (!expr) return;
         switch (expr->kind) {
         case ExprKind::IDENT:
             used.insert(static_cast<IdentExpr*>(expr)->name);
@@ -2879,6 +2888,7 @@ private:
     // ========== 函数预分析：检测叶函数、统计变量使用 ==========
     // 检查表达式是否包含函数调用
     bool exprHasCall(Expr* expr) {
+        if (!expr) return false;
         switch (expr->kind) {
         case ExprKind::NUMBER:
         case ExprKind::IDENT:
