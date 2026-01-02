@@ -1358,6 +1358,63 @@ private:
         return false;
     }
 
+    unique_ptr<Expr> hoistInvariantSubexpr(Expr* expr,
+                                          const set<string>& modifiedVars,
+                                          vector<unique_ptr<Stmt>>& hoisted,
+                                          map<string, string>& hoistedExprMap,
+                                          int& hoistedExprCount) {
+        if (!expr) return nullptr;
+        switch (expr->kind) {
+        case ExprKind::NUMBER:
+            return make_unique<NumberExpr>(static_cast<NumberExpr*>(expr)->value);
+        case ExprKind::IDENT:
+            return make_unique<IdentExpr>(static_cast<IdentExpr*>(expr)->name);
+        case ExprKind::UNARY: {
+            auto* u = static_cast<UnaryExpr*>(expr);
+            auto operand = hoistInvariantSubexpr(u->operand.get(), modifiedVars, hoisted, hoistedExprMap, hoistedExprCount);
+            auto rebuilt = make_unique<UnaryExpr>(u->op, move(operand));
+            string sig = exprToString(rebuilt.get());
+            if (sig.length() >= 5 && !hasCallExpr(rebuilt.get()) &&
+                isLoopInvariant(rebuilt.get(), modifiedVars)) {
+                auto it = hoistedExprMap.find(sig);
+                if (it != hoistedExprMap.end()) return make_unique<IdentExpr>(it->second);
+                string tmpName = "__licm_" + to_string(hoistedExprCount++);
+                hoistedExprMap[sig] = tmpName;
+                hoisted.push_back(make_unique<VarDeclStmt>(tmpName, move(rebuilt)));
+                return make_unique<IdentExpr>(tmpName);
+            }
+            return rebuilt;
+        }
+        case ExprKind::BINARY: {
+            auto* b = static_cast<BinaryExpr*>(expr);
+            auto left = hoistInvariantSubexpr(b->left.get(), modifiedVars, hoisted, hoistedExprMap, hoistedExprCount);
+            auto right = hoistInvariantSubexpr(b->right.get(), modifiedVars, hoisted, hoistedExprMap, hoistedExprCount);
+            auto rebuilt = make_unique<BinaryExpr>(b->op, move(left), move(right));
+            string sig = exprToString(rebuilt.get());
+            if (sig.length() >= 5 && !hasCallExpr(rebuilt.get()) &&
+                isLoopInvariant(rebuilt.get(), modifiedVars)) {
+                auto it = hoistedExprMap.find(sig);
+                if (it != hoistedExprMap.end()) return make_unique<IdentExpr>(it->second);
+                string tmpName = "__licm_" + to_string(hoistedExprCount++);
+                hoistedExprMap[sig] = tmpName;
+                hoisted.push_back(make_unique<VarDeclStmt>(tmpName, move(rebuilt)));
+                return make_unique<IdentExpr>(tmpName);
+            }
+            return rebuilt;
+        }
+        case ExprKind::CALL: {
+            auto* c = static_cast<CallExpr*>(expr);
+            auto newCall = make_unique<CallExpr>(c->funcName);
+            for (auto& arg : c->args) {
+                newCall->args.push_back(
+                    hoistInvariantSubexpr(arg.get(), modifiedVars, hoisted, hoistedExprMap, hoistedExprCount));
+            }
+            return newCall;
+        }
+        }
+        return nullptr;
+    }
+
     // 循环不变量外提
     void hoistLoopInvariants(WhileStmt* whileStmt, vector<unique_ptr<Stmt>>& hoisted) {
         if (whileStmt->body->kind != StmtKind::BLOCK) return;
@@ -1367,12 +1424,20 @@ private:
         set<string> modifiedVars;
         collectModifiedVars(whileStmt->body.get(), modifiedVars);
 
+        // 先外提循环条件中的不变子表达式（条件每次都会执行，因此安全）
+        map<string, string> hoistedExprMap;
+        int hoistedExprCount = 0;
+        whileStmt->cond = hoistInvariantSubexpr(whileStmt->cond.get(), modifiedVars,
+                                               hoisted, hoistedExprMap, hoistedExprCount);
+
         // 遍历循环体，提取可外提的语句
         for (auto it = body->stmts.begin(); it != body->stmts.end(); ) {
             Stmt* stmt = it->get();
 
             if (stmt->kind == StmtKind::VARDECL) {
                 auto* varDecl = static_cast<VarDeclStmt*>(stmt);
+                varDecl->init = hoistInvariantSubexpr(varDecl->init.get(), modifiedVars,
+                                                     hoisted, hoistedExprMap, hoistedExprCount);
                 // 如果初始化表达式是循环不变量，且变量在循环中不被再次赋值
                 if (isLoopInvariant(varDecl->init.get(), modifiedVars)) {
                     // 检查这个变量是否在循环体其他地方被修改
@@ -1388,6 +1453,27 @@ private:
                         continue;
                     }
                 }
+            } else if (stmt->kind == StmtKind::ASSIGN) {
+                auto* assign = static_cast<AssignStmt*>(stmt);
+                assign->value = hoistInvariantSubexpr(assign->value.get(), modifiedVars,
+                                                     hoisted, hoistedExprMap, hoistedExprCount);
+                if (isLoopInvariant(assign->value.get(), modifiedVars)) {
+                    set<string> otherMods;
+                    for (auto& s : body->stmts) {
+                        if (s.get() != stmt) {
+                            collectModifiedVars(s.get(), otherMods);
+                        }
+                    }
+                    if (otherMods.find(assign->name) == otherMods.end()) {
+                        hoisted.push_back(move(*it));
+                        it = body->stmts.erase(it);
+                        continue;
+                    }
+                }
+            } else if (stmt->kind == StmtKind::EXPR) {
+                auto* exprStmt = static_cast<ExprStmt*>(stmt);
+                exprStmt->expr = hoistInvariantSubexpr(exprStmt->expr.get(), modifiedVars,
+                                                      hoisted, hoistedExprMap, hoistedExprCount);
             }
             ++it;
         }
@@ -1397,8 +1483,36 @@ private:
     map<string, string> cseMap;
     int cseTempCount = 0;
 
+    void countCseCandidatesInExpr(Expr* expr, map<string, int>& exprCount) {
+        if (!expr) return;
+        switch (expr->kind) {
+        case ExprKind::NUMBER:
+        case ExprKind::IDENT:
+            return;
+        case ExprKind::UNARY:
+            countCseCandidatesInExpr(static_cast<UnaryExpr*>(expr)->operand.get(), exprCount);
+            return;
+        case ExprKind::BINARY: {
+            auto* b = static_cast<BinaryExpr*>(expr);
+            countCseCandidatesInExpr(b->left.get(), exprCount);
+            countCseCandidatesInExpr(b->right.get(), exprCount);
+            string sig = exprToString(expr);
+            if (sig.length() >= 5 && !hasCallExpr(expr)) {
+                exprCount[sig]++;
+            }
+            return;
+        }
+        case ExprKind::CALL: {
+            auto* c = static_cast<CallExpr*>(expr);
+            for (auto& arg : c->args) countCseCandidatesInExpr(arg.get(), exprCount);
+            return;
+        }
+        }
+    }
+
     // 对表达式进行 CSE，返回优化后的表达式
-    unique_ptr<Expr> cseExpr(Expr* expr, vector<unique_ptr<Stmt>>& preStmts) {
+    unique_ptr<Expr> cseExpr(Expr* expr, vector<unique_ptr<Stmt>>& preStmts,
+                             const map<string, int>& exprCount) {
         switch (expr->kind) {
         case ExprKind::NUMBER:
             return make_unique<NumberExpr>(static_cast<NumberExpr*>(expr)->value);
@@ -1406,20 +1520,22 @@ private:
             return make_unique<IdentExpr>(static_cast<IdentExpr*>(expr)->name);
         case ExprKind::UNARY: {
             auto* u = static_cast<UnaryExpr*>(expr);
-            auto operand = cseExpr(u->operand.get(), preStmts);
+            auto operand = cseExpr(u->operand.get(), preStmts, exprCount);
             return make_unique<UnaryExpr>(u->op, move(operand));
         }
         case ExprKind::BINARY: {
             auto* b = static_cast<BinaryExpr*>(expr);
-            auto left = cseExpr(b->left.get(), preStmts);
-            auto right = cseExpr(b->right.get(), preStmts);
+            string sig = exprToString(expr);
+            auto left = cseExpr(b->left.get(), preStmts, exprCount);
+            auto right = cseExpr(b->right.get(), preStmts, exprCount);
 
             // 构建表达式签名
             auto newExpr = make_unique<BinaryExpr>(b->op, move(left), move(right));
-            string sig = exprToString(newExpr.get());
+            auto itCount = exprCount.find(sig);
+            bool shouldExtract = (itCount != exprCount.end() && itCount->second >= 2);
 
             // 检查是否已经计算过（只对复杂表达式进行 CSE）
-            if (sig.length() > 5 && !hasCallExpr(newExpr.get())) {
+            if (shouldExtract && sig.length() >= 5 && !hasCallExpr(newExpr.get())) {
                 if (cseMap.count(sig)) {
                     return make_unique<IdentExpr>(cseMap[sig]);
                 }
@@ -1435,7 +1551,7 @@ private:
             auto* c = static_cast<CallExpr*>(expr);
             auto newCall = make_unique<CallExpr>(c->funcName);
             for (auto& arg : c->args) {
-                newCall->args.push_back(cseExpr(arg.get(), preStmts));
+                newCall->args.push_back(cseExpr(arg.get(), preStmts, exprCount));
             }
             return newCall;
         }
@@ -1446,86 +1562,124 @@ private:
     // 对语句列表进行 CSE
     void cseStmtList(vector<unique_ptr<Stmt>>& stmts) {
         vector<unique_ptr<Stmt>> newStmts;
+        size_t segStart = 0;
+        while (segStart < stmts.size()) {
+            size_t segEnd = segStart;
+            while (segEnd < stmts.size() && stmts[segEnd]->kind != StmtKind::WHILE) segEnd++;
 
-        for (auto& stmt : stmts) {
-            vector<unique_ptr<Stmt>> preStmts;
+            // 第一遍：统计本段（线性代码段）中可做 CSE 的表达式出现次数
+            map<string, int> exprCount;
+            for (size_t j = segStart; j < segEnd; j++) {
+                Stmt* stmt = stmts[j].get();
+                switch (stmt->kind) {
+                case StmtKind::VARDECL:
+                    countCseCandidatesInExpr(static_cast<VarDeclStmt*>(stmt)->init.get(), exprCount);
+                    break;
+                case StmtKind::ASSIGN:
+                    countCseCandidatesInExpr(static_cast<AssignStmt*>(stmt)->value.get(), exprCount);
+                    break;
+                case StmtKind::RETURN: {
+                    auto* r = static_cast<ReturnStmt*>(stmt);
+                    if (r->value) countCseCandidatesInExpr(r->value.get(), exprCount);
+                    break;
+                }
+                case StmtKind::IF:
+                    countCseCandidatesInExpr(static_cast<IfStmt*>(stmt)->cond.get(), exprCount);
+                    break;
+                case StmtKind::EXPR:
+                    countCseCandidatesInExpr(static_cast<ExprStmt*>(stmt)->expr.get(), exprCount);
+                    break;
+                default:
+                    break;
+                }
+            }
 
-            switch (stmt->kind) {
-            case StmtKind::VARDECL: {
-                auto* v = static_cast<VarDeclStmt*>(stmt.get());
-                v->init = cseExpr(v->init.get(), preStmts);
-                // 变量赋值后，包含该变量的 CSE 项失效
-                for (auto it = cseMap.begin(); it != cseMap.end(); ) {
-                    if (it->first.find(v->name) != string::npos) {
-                        it = cseMap.erase(it);
-                    } else {
-                        ++it;
-                    }
-                }
-                break;
-            }
-            case StmtKind::ASSIGN: {
-                auto* a = static_cast<AssignStmt*>(stmt.get());
-                a->value = cseExpr(a->value.get(), preStmts);
-                // 变量赋值后，包含该变量的 CSE 项失效
-                for (auto it = cseMap.begin(); it != cseMap.end(); ) {
-                    if (it->first.find(a->name) != string::npos) {
-                        it = cseMap.erase(it);
-                    } else {
-                        ++it;
-                    }
-                }
-                break;
-            }
-            case StmtKind::RETURN: {
-                auto* r = static_cast<ReturnStmt*>(stmt.get());
-                if (r->value) r->value = cseExpr(r->value.get(), preStmts);
-                break;
-            }
-            case StmtKind::IF: {
-                auto* i = static_cast<IfStmt*>(stmt.get());
-                i->cond = cseExpr(i->cond.get(), preStmts);
-                // 分支内不进行CSE（保守策略，避免作用域问题）
-                // 清理可能在分支内被修改的变量的 CSE 项
-                set<string> modifiedVars;
-                collectModifiedVars(i->thenStmt.get(), modifiedVars);
-                if (i->elseStmt) collectModifiedVars(i->elseStmt.get(), modifiedVars);
-                for (auto it = cseMap.begin(); it != cseMap.end(); ) {
-                    bool shouldErase = false;
-                    for (const auto& var : modifiedVars) {
-                        if (it->first.find(var) != string::npos) {
-                            shouldErase = true;
-                            break;
+            // 第二遍：仅对出现次数 >= 2 的表达式做 CSE
+            for (size_t j = segStart; j < segEnd; j++) {
+                vector<unique_ptr<Stmt>> preStmts;
+                auto& stmt = stmts[j];
+
+                switch (stmt->kind) {
+                case StmtKind::VARDECL: {
+                    auto* v = static_cast<VarDeclStmt*>(stmt.get());
+                    v->init = cseExpr(v->init.get(), preStmts, exprCount);
+                    // 变量赋值后，包含该变量的 CSE 项失效
+                    for (auto it = cseMap.begin(); it != cseMap.end(); ) {
+                        if (it->first.find(v->name) != string::npos) {
+                            it = cseMap.erase(it);
+                        } else {
+                            ++it;
                         }
                     }
-                    if (shouldErase) {
-                        it = cseMap.erase(it);
-                    } else {
-                        ++it;
-                    }
+                    break;
                 }
-                break;
-            }
-            case StmtKind::WHILE: {
-                auto* w = static_cast<WhileStmt*>(stmt.get());
-                // 循环内不进行CSE（保守策略，避免作用域问题）
-                cseMap.clear();
-                break;
-            }
-            case StmtKind::EXPR: {
-                auto* e = static_cast<ExprStmt*>(stmt.get());
-                e->expr = cseExpr(e->expr.get(), preStmts);
-                break;
-            }
-            default:
-                break;
+                case StmtKind::ASSIGN: {
+                    auto* a = static_cast<AssignStmt*>(stmt.get());
+                    a->value = cseExpr(a->value.get(), preStmts, exprCount);
+                    // 变量赋值后，包含该变量的 CSE 项失效
+                    for (auto it = cseMap.begin(); it != cseMap.end(); ) {
+                        if (it->first.find(a->name) != string::npos) {
+                            it = cseMap.erase(it);
+                        } else {
+                            ++it;
+                        }
+                    }
+                    break;
+                }
+                case StmtKind::RETURN: {
+                    auto* r = static_cast<ReturnStmt*>(stmt.get());
+                    if (r->value) r->value = cseExpr(r->value.get(), preStmts, exprCount);
+                    break;
+                }
+                case StmtKind::IF: {
+                    auto* i = static_cast<IfStmt*>(stmt.get());
+                    i->cond = cseExpr(i->cond.get(), preStmts, exprCount);
+                    // 分支内不进行 CSE（保守策略，避免作用域问题）
+                    // 清理可能在分支内被修改的变量的 CSE 项
+                    set<string> modifiedVars;
+                    collectModifiedVars(i->thenStmt.get(), modifiedVars);
+                    if (i->elseStmt) collectModifiedVars(i->elseStmt.get(), modifiedVars);
+                    for (auto it = cseMap.begin(); it != cseMap.end(); ) {
+                        bool shouldErase = false;
+                        for (const auto& var : modifiedVars) {
+                            if (it->first.find(var) != string::npos) {
+                                shouldErase = true;
+                                break;
+                            }
+                        }
+                        if (shouldErase) {
+                            it = cseMap.erase(it);
+                        } else {
+                            ++it;
+                        }
+                    }
+                    break;
+                }
+                case StmtKind::EXPR: {
+                    auto* e = static_cast<ExprStmt*>(stmt.get());
+                    e->expr = cseExpr(e->expr.get(), preStmts, exprCount);
+                    break;
+                }
+                default:
+                    break;
+                }
+
+                // 插入预生成的语句
+                for (auto& pre : preStmts) {
+                    newStmts.push_back(move(pre));
+                }
+                newStmts.push_back(move(stmt));
             }
 
-            // 插入预生成的语句
-            for (auto& pre : preStmts) {
-                newStmts.push_back(move(pre));
+            // 处理 while 作为 CSE 边界
+            if (segEnd < stmts.size()) {
+                // 循环内不进行 CSE（保守策略，避免作用域问题）
+                cseMap.clear();
+                newStmts.push_back(move(stmts[segEnd]));
+                segEnd++;
             }
-            newStmts.push_back(move(stmt));
+
+            segStart = segEnd;
         }
 
         stmts = move(newStmts);
@@ -1804,6 +1958,7 @@ private:
     // 在表达式中进行强度削减替换
     int strengthReductionCount = 0;
     map<string, string> strengthReductionMap;  // "i*4" -> "__sr_0"
+    map<string, string> srVarToInductionVar;  // "__sr_0" -> "i"
 
     unique_ptr<Expr> applyStrengthReduction(Expr* expr, const map<string, int>& inductionVars,
                                             vector<unique_ptr<Stmt>>& preLoop,
@@ -1829,9 +1984,16 @@ private:
                 string key = varName + "*" + to_string(multiplier);
 
                 if (!strengthReductionMap.count(key)) {
+                    if (!initVals.count(varName)) {
+                        // 无法确定初值时不做强度削减，避免语义错误
+                        return make_unique<BinaryExpr>(binary->op,
+                            applyStrengthReduction(binary->left.get(), inductionVars, preLoop, inLoop, initVals),
+                            applyStrengthReduction(binary->right.get(), inductionVars, preLoop, inLoop, initVals));
+                    }
                     // 创建新的辅助变量
                     string newVar = "__sr_" + to_string(strengthReductionCount++);
                     strengthReductionMap[key] = newVar;
+                    srVarToInductionVar[newVar] = varName;
 
                     // 计算初始值：init_i * multiplier
                     int initVal = initVals.count(varName) ? initVals.at(varName) : 0;
@@ -1951,6 +2113,7 @@ private:
 
                 // 重置强度削减状态
                 strengthReductionMap.clear();
+                srVarToInductionVar.clear();
 
                 // 存储需要添加的语句
                 vector<unique_ptr<Stmt>> preLoop;
@@ -1963,23 +2126,40 @@ private:
                         applyStrengthReductionToStmt(s.get(), inductionVars, preLoop, inLoopEnd, initVals);
                     }
 
-                    // 将增量语句添加到循环体末尾（在归纳变量更新之前）
+                    // 将增量语句添加到循环体末尾（尽量插入到对应归纳变量更新之前）
+                    vector<pair<size_t, unique_ptr<Stmt>>> pendingInserts;
+                    pendingInserts.reserve(inLoopEnd.size());
+
                     for (auto& s : inLoopEnd) {
-                        // 找到归纳变量更新的位置，在其前面插入
-                        bool inserted = false;
-                        for (size_t k = body->stmts.size(); k > 0; k--) {
-                            if (body->stmts[k-1]->kind == StmtKind::ASSIGN) {
-                                auto* assign = static_cast<AssignStmt*>(body->stmts[k-1].get());
-                                if (inductionVars.count(assign->name)) {
-                                    body->stmts.insert(body->stmts.begin() + k - 1, move(s));
-                                    inserted = true;
-                                    break;
+                        string inductionVar;
+                        if (s && s->kind == StmtKind::ASSIGN) {
+                            auto* a = static_cast<AssignStmt*>(s.get());
+                            auto it = srVarToInductionVar.find(a->name);
+                            if (it != srVarToInductionVar.end()) inductionVar = it->second;
+                        }
+
+                        size_t insertPos = body->stmts.size();
+                        if (!inductionVar.empty()) {
+                            for (size_t k = body->stmts.size(); k > 0; k--) {
+                                if (body->stmts[k - 1]->kind == StmtKind::ASSIGN) {
+                                    auto* assign = static_cast<AssignStmt*>(body->stmts[k - 1].get());
+                                    if (assign->name == inductionVar) {
+                                        insertPos = k - 1;
+                                        break;
+                                    }
                                 }
                             }
                         }
-                        if (!inserted) {
-                            body->stmts.push_back(move(s));
-                        }
+                        pendingInserts.push_back({insertPos, move(s)});
+                    }
+
+                    // 逆序插入避免索引偏移问题
+                    stable_sort(pendingInserts.begin(), pendingInserts.end(),
+                        [](const auto& a, const auto& b) { return a.first > b.first; });
+                    for (auto& item : pendingInserts) {
+                        if (!item.second) continue;
+                        if (item.first > body->stmts.size()) item.first = body->stmts.size();
+                        body->stmts.insert(body->stmts.begin() + item.first, move(item.second));
                     }
                 }
 
@@ -3880,6 +4060,8 @@ private:
                             }
                         }
                     }
+                    // 定义点 kill 掉自身
+                    currentLive.erase(a->name);
                     // 添加右侧表达式使用的变量
                     addUsedVarsToLive(a->value.get(), currentLive);
                     break;
@@ -4119,6 +4301,11 @@ private:
         }
         }
         return false;
+    }
+
+    bool isSimpleArgExpr(Expr* expr) {
+        if (!expr) return false;
+        return expr->kind == ExprKind::NUMBER || expr->kind == ExprKind::IDENT;
     }
 
     // ========== 表达式寄存器分配（Sethi-Ullman） ==========
@@ -4641,8 +4828,13 @@ private:
             int argCount = call->args.size();
             int stackArgs = (argCount > 8) ? (argCount - 8) : 0;
 
-            int tempSpace = argCount * 4;          // 临时区：保存所有实参值
-            int stackArgsSpace = stackArgs * 4;    // 出参区：a8+ 的参数
+            bool allSimple = true;
+            for (int i = 0; i < argCount; i++) {
+                if (!isSimpleArgExpr(call->args[i].get())) { allSimple = false; break; }
+            }
+
+            int tempSpace = allSimple ? 0 : argCount * 4;  // 临时区：保存所有实参值（需要时）
+            int stackArgsSpace = stackArgs * 4;            // 出参区：a8+ 的参数
             int baseAlloc = tempSpace + stackArgsSpace;
 
             // 保障 call 前 sp 16B 对齐（RISC-V ABI）
@@ -4659,21 +4851,67 @@ private:
             if (argCount > 0) {
                 int tempOffset = stackArgsSpace;
 
-                // 1) 依次求值并写入临时区（避免嵌套调用覆盖 a/t 寄存器）
-                for (int i = 0; i < argCount; i++) {
-                    genExpr(call->args[i].get());
-                    emit("sw t0, " + to_string(tempOffset + i * 4) + "(sp)");
-                }
+                if (allSimple) {
+                    // a0-a7 直接装载（无副作用时可跳过临时区）
+                    for (int i = 0; i < argCount && i < 8; i++) {
+                        if (call->args[i]->kind == ExprKind::NUMBER) {
+                            emit("li a" + to_string(i) + ", " +
+                                 to_string(static_cast<NumberExpr*>(call->args[i].get())->value));
+                        } else {
+                            auto* ident = static_cast<IdentExpr*>(call->args[i].get());
+                            if (g_optimize && varToReg.count(ident->name)) {
+                                emit("mv a" + to_string(i) + ", " + varToReg[ident->name]);
+                            } else {
+                                int paramIdx;
+                                int offset = lookupVar(ident->name, paramIdx);
+                                if (paramIdx >= 0) {
+                                    emit("lw a" + to_string(i) + ", " +
+                                         to_string(paramSlotOffset(paramIdx)) + "(s0)");
+                                } else {
+                                    emit("lw a" + to_string(i) + ", " + to_string(offset) + "(s0)");
+                                }
+                            }
+                        }
+                    }
 
-                // 2) 加载 a0-a7
-                for (int i = 0; i < argCount && i < 8; i++) {
-                    emit("lw a" + to_string(i) + ", " + to_string(tempOffset + i * 4) + "(sp)");
-                }
+                    // a8+ 写入调用者出参区（sp+0 开始）
+                    for (int i = 8; i < argCount; i++) {
+                        if (call->args[i]->kind == ExprKind::NUMBER) {
+                            emit("li t0, " + to_string(static_cast<NumberExpr*>(call->args[i].get())->value));
+                            emit("sw t0, " + to_string((i - 8) * 4) + "(sp)");
+                        } else {
+                            auto* ident = static_cast<IdentExpr*>(call->args[i].get());
+                            if (g_optimize && varToReg.count(ident->name)) {
+                                emit("mv t0, " + varToReg[ident->name]);
+                            } else {
+                                int paramIdx;
+                                int offset = lookupVar(ident->name, paramIdx);
+                                if (paramIdx >= 0) {
+                                    emit("lw t0, " + to_string(paramSlotOffset(paramIdx)) + "(s0)");
+                                } else {
+                                    emit("lw t0, " + to_string(offset) + "(s0)");
+                                }
+                            }
+                            emit("sw t0, " + to_string((i - 8) * 4) + "(sp)");
+                        }
+                    }
+                } else {
+                    // 1) 依次求值并写入临时区（避免嵌套调用覆盖 a/t 寄存器）
+                    for (int i = 0; i < argCount; i++) {
+                        genExpr(call->args[i].get());
+                        emit("sw t0, " + to_string(tempOffset + i * 4) + "(sp)");
+                    }
 
-                // 3) 复制 a8+ 到出参区（sp+0 开始）
-                for (int i = 8; i < argCount; i++) {
-                    emit("lw t0, " + to_string(tempOffset + i * 4) + "(sp)");
-                    emit("sw t0, " + to_string((i - 8) * 4) + "(sp)");
+                    // 2) 加载 a0-a7
+                    for (int i = 0; i < argCount && i < 8; i++) {
+                        emit("lw a" + to_string(i) + ", " + to_string(tempOffset + i * 4) + "(sp)");
+                    }
+
+                    // 3) 复制 a8+ 到出参区（sp+0 开始）
+                    for (int i = 8; i < argCount; i++) {
+                        emit("lw t0, " + to_string(tempOffset + i * 4) + "(sp)");
+                        emit("sw t0, " + to_string((i - 8) * 4) + "(sp)");
+                    }
                 }
             }
 
@@ -4756,7 +4994,8 @@ private:
             if (g_optimize && varToReg.count(varDecl->name)) {
                 emit("mv " + varToReg[varDecl->name] + ", t0");
                 // 仍然分配栈空间（用于调试和一致性）
-                allocVar(varDecl->name);
+                int offset = allocVar(varDecl->name);
+                emit("sw t0, " + to_string(offset) + "(s0)");
             } else {
                 int offset = allocVar(varDecl->name);
                 emit("sw t0, " + to_string(offset) + "(s0)");
@@ -4769,6 +5008,13 @@ private:
             // 检查是否分配了寄存器
             if (g_optimize && varToReg.count(assign->name)) {
                 emit("mv " + varToReg[assign->name] + ", t0");
+                int paramIdx;
+                int offset = lookupVar(assign->name, paramIdx);
+                if (paramIdx >= 0) {
+                    emit("sw t0, " + to_string(paramSlotOffset(paramIdx)) + "(s0)");
+                } else {
+                    emit("sw t0, " + to_string(offset) + "(s0)");
+                }
                 break;
             }
             int paramIdx;
@@ -5273,7 +5519,23 @@ private:
                 }
 
                 // 模式19: beqz t0, L; j L2; L: -> beqz 可能可以优化
-                // （这个模式较复杂，暂时跳过）
+                if (op == "beqz" && operands.size() == 2 && i + 2 < lines.size()) {
+                    auto [nextOp, nextOperands] = parseInstruction(lines[i + 1]);
+                    if (nextOp == "j" && nextOperands.size() == 1) {
+                        string nextNextLine = lines[i + 2];
+                        size_t start = nextNextLine.find_first_not_of(" \t");
+                        if (start != string::npos) {
+                            string label = nextNextLine.substr(start);
+                            if (label == operands[1] + ":") {
+                                // beqz r, L1; j L2; L1:  ==>  bnez r, L2; L1:
+                                newLines.push_back("\tbnez " + operands[0] + ", " + nextOperands[0]);
+                                i++;  // 跳过 j
+                                changed = true;
+                                continue;
+                            }
+                        }
+                    }
+                }
 
                 newLines.push_back(lines[i]);
             }
