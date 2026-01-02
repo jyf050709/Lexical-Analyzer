@@ -2945,6 +2945,7 @@ private:
 
     // 统计表达式中变量的使用次数
     void countVarUseInExpr(Expr* expr) {
+        if (!expr) return;
         switch (expr->kind) {
         case ExprKind::IDENT:
             varUseFreq[static_cast<IdentExpr*>(expr)->name]++;
@@ -3065,6 +3066,7 @@ private:
     // ========== SU编号：用于表达式寄存器分配 ==========
     // 计算表达式的 Sethi-Ullman 寄存器需求数
     int computeSU(Expr* expr) {
+        if (!expr) return 0;
         switch (expr->kind) {
         case ExprKind::NUMBER:
         case ExprKind::IDENT:
@@ -3152,6 +3154,7 @@ private:
     // 生成表达式，结果存入t0
     // 优化：使用 switch + static_cast 替代 dynamic_cast，避免 RTTI 开销
     void genExpr(Expr* expr) {
+        if (!expr) return;
         switch (expr->kind) {
         case ExprKind::NUMBER: {
             auto* num = static_cast<NumberExpr*>(expr);
