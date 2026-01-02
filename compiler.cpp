@@ -347,8 +347,14 @@ private:
         }
         if (match(TokenType::INT)) {
             string name = consume(TokenType::IDENT).value;
-            consume(TokenType::ASSIGN);
-            auto init = parseExpr();
+            unique_ptr<Expr> init = nullptr;
+            if (match(TokenType::ASSIGN)) {
+                init = parseExpr();
+            } else {
+                // 允许未初始化的局部变量声明：int x;
+                // 约定默认初始化为 0，便于后续优化/代码生成阶段统一处理
+                init = make_unique<NumberExpr>(0);
+            }
             consume(TokenType::SEMICOLON);
             return make_unique<VarDeclStmt>(name, move(init));
         }
