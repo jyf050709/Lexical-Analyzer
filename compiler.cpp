@@ -5258,7 +5258,8 @@ private:
 
         // 栈帧：固定保留 ra 槽位 + s0 槽位（8B），再加上 sRegs/参数/局部变量
         // 即使是叶函数不保存 ra，也保留 ra 槽位以保持统一布局，避免参数槽越界。
-        int neededSpace = 8 + sRegSaveCount * 4 + paramCount * 4 + localVarCount * 4;
+        // 基础 16 字节确保有足够空间存放 ra、s0 以及局部变量的起始偏移
+        int neededSpace = 16 + sRegSaveCount * 4 + paramCount * 4 + localVarCount * 4;
         frameSize = ((neededSpace + 15) / 16) * 16;
 
         // 函数标签
@@ -5647,8 +5648,7 @@ public:
         for (auto& func : prog->functions) {
             genFunc(func.get());
         }
-        // 默认不启用窥孔优化：部分控制流改写在边界场景下可能不等价，导致评测“错误输出”。
-        return out.str();
+        return peepholeOptimize(out.str());
     }
 };
 
@@ -5658,7 +5658,7 @@ int main(int argc, char* argv[]) {
     for (int i = 1; i < argc; i++) {
         if (string(argv[i]) == "-opt") {
             // 暂时禁用优化以排查问题
-            g_optimize = false;
+            g_optimize = true;
         }
     }
 
