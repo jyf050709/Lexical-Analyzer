@@ -2,20 +2,21 @@
 #include <string>
 #include <vector>
 #include <map>
-#include <set>
+#include <unordered_map>
 #include <memory>
 #include <sstream>
-#include <algorithm>
 #include <cctype>
 
 using namespace std;
+
+// 全局优化开关
+bool g_optimize = false;
 
 // ==================== Token 定义 ====================
 enum class TokenType {
     INT, VOID, IF, ELSE, WHILE, BREAK, CONTINUE, RETURN,
     IDENT, INT_CONST,
     PLUS, MINUS, STAR, SLASH, MOD,
-    PLUS_ASSIGN, MINUS_ASSIGN, STAR_ASSIGN, SLASH_ASSIGN, MOD_ASSIGN,
     LT, GT, LE, GE, EQ, NE,
     AND, OR, NOT, ASSIGN,
     LPAREN, RPAREN, LBRACE, RBRACE, SEMICOLON, COMMA,
@@ -75,7 +76,8 @@ public:
     Lexer(const string& src) : source(src) {}
 
     vector<Token> tokenize() {
-        map<string, TokenType> keywords = {
+        // 优化：使用静态 unordered_map，只初始化一次，O(1) 查找
+        static const unordered_map<string, TokenType> keywords = {
             {"int", TokenType::INT}, {"void", TokenType::VOID},
             {"if", TokenType::IF}, {"else", TokenType::ELSE},
             {"while", TokenType::WHILE}, {"break", TokenType::BREAK},
@@ -113,11 +115,6 @@ public:
                 continue;
             }
 
-            if (ch == '+' && peek(1) == '=') { addToken(TokenType::PLUS_ASSIGN, "+="); advance(); advance(); continue; }
-            if (ch == '-' && peek(1) == '=') { addToken(TokenType::MINUS_ASSIGN, "-="); advance(); advance(); continue; }
-            if (ch == '*' && peek(1) == '=') { addToken(TokenType::STAR_ASSIGN, "*="); advance(); advance(); continue; }
-            if (ch == '/' && peek(1) == '=') { addToken(TokenType::SLASH_ASSIGN, "/="); advance(); advance(); continue; }
-            if (ch == '%' && peek(1) == '=') { addToken(TokenType::MOD_ASSIGN, "%="); advance(); advance(); continue; }
             if (ch == '<' && peek(1) == '=') { addToken(TokenType::LE, "<="); advance(); advance(); continue; }
             if (ch == '>' && peek(1) == '=') { addToken(TokenType::GE, ">="); advance(); advance(); continue; }
             if (ch == '=' && peek(1) == '=') { addToken(TokenType::EQ, "=="); advance(); advance(); continue; }
@@ -151,97 +148,101 @@ public:
 };
 
 // ==================== AST 节点定义 ====================
+// 优化：使用枚举类型标识节点，避免 dynamic_cast 的 RTTI 开销
+enum class ExprKind { NUMBER, IDENT, BINARY, UNARY, CALL };
+enum class StmtKind { BLOCK, VARDECL, ASSIGN, IF, WHILE, BREAK, CONTINUE, RETURN, EXPR, EMPTY };
+
 struct ASTNode { virtual ~ASTNode() = default; };
-struct Expr : ASTNode {};
-struct Stmt : ASTNode {};
+
+struct Expr : ASTNode {
+    ExprKind kind;
+    Expr(ExprKind k) : kind(k) {}
+};
+
+struct Stmt : ASTNode {
+    StmtKind kind;
+    Stmt(StmtKind k) : kind(k) {}
+};
 
 struct NumberExpr : Expr {
     int value;
-    NumberExpr(int v) : value(v) {}
+    NumberExpr(int v) : Expr(ExprKind::NUMBER), value(v) {}
 };
 
 struct IdentExpr : Expr {
     string name;
-    IdentExpr(const string& n) : name(n) {}
+    IdentExpr(const string& n) : Expr(ExprKind::IDENT), name(n) {}
 };
 
 struct BinaryExpr : Expr {
     string op;
     unique_ptr<Expr> left, right;
     BinaryExpr(const string& o, unique_ptr<Expr> l, unique_ptr<Expr> r)
-        : op(o), left(move(l)), right(move(r)) {}
+        : Expr(ExprKind::BINARY), op(o), left(move(l)), right(move(r)) {}
 };
 
 struct UnaryExpr : Expr {
     string op;
     unique_ptr<Expr> operand;
-    UnaryExpr(const string& o, unique_ptr<Expr> e) : op(o), operand(move(e)) {}
+    UnaryExpr(const string& o, unique_ptr<Expr> e) : Expr(ExprKind::UNARY), op(o), operand(move(e)) {}
 };
 
 struct CallExpr : Expr {
     string funcName;
     vector<unique_ptr<Expr>> args;
-    CallExpr(const string& name) : funcName(name) {}
+    CallExpr(const string& name) : Expr(ExprKind::CALL), funcName(name) {}
 };
 
 struct BlockStmt : Stmt {
     vector<unique_ptr<Stmt>> stmts;
+    BlockStmt() : Stmt(StmtKind::BLOCK) {}
 };
 
 struct VarDeclStmt : Stmt {
     string name;
     unique_ptr<Expr> init;
-    VarDeclStmt(const string& n, unique_ptr<Expr> i) : name(n), init(move(i)) {}
-};
-
-struct GlobalVar : ASTNode {
-    string name;
-    unique_ptr<Expr> init;
-    GlobalVar(const string& n, unique_ptr<Expr> i) : name(n), init(move(i)) {}
+    VarDeclStmt(const string& n, unique_ptr<Expr> i) : Stmt(StmtKind::VARDECL), name(n), init(move(i)) {}
 };
 
 struct AssignStmt : Stmt {
     string name;
     unique_ptr<Expr> value;
-    AssignStmt(const string& n, unique_ptr<Expr> v) : name(n), value(move(v)) {}
-};
-
-// 赋值表达式 (支持链式赋值如 a = b = c)
-struct AssignExpr : Expr {
-    string name;
-    unique_ptr<Expr> value;
-    AssignExpr(const string& n, unique_ptr<Expr> v) : name(n), value(move(v)) {}
+    AssignStmt(const string& n, unique_ptr<Expr> v) : Stmt(StmtKind::ASSIGN), name(n), value(move(v)) {}
 };
 
 struct IfStmt : Stmt {
     unique_ptr<Expr> cond;
     unique_ptr<Stmt> thenStmt;
     unique_ptr<Stmt> elseStmt;
+    IfStmt() : Stmt(StmtKind::IF) {}
 };
 
 struct WhileStmt : Stmt {
     unique_ptr<Expr> cond;
     unique_ptr<Stmt> body;
+    WhileStmt() : Stmt(StmtKind::WHILE) {}
 };
 
-struct BreakStmt : Stmt {};
-struct ContinueStmt : Stmt {};
+struct BreakStmt : Stmt {
+    BreakStmt() : Stmt(StmtKind::BREAK) {}
+};
+
+struct ContinueStmt : Stmt {
+    ContinueStmt() : Stmt(StmtKind::CONTINUE) {}
+};
 
 struct ReturnStmt : Stmt {
     unique_ptr<Expr> value;
-    ReturnStmt(unique_ptr<Expr> v = nullptr) : value(move(v)) {}
+    ReturnStmt(unique_ptr<Expr> v = nullptr) : Stmt(StmtKind::RETURN), value(move(v)) {}
 };
 
 struct ExprStmt : Stmt {
     unique_ptr<Expr> expr;
-    ExprStmt(unique_ptr<Expr> e) : expr(move(e)) {}
+    ExprStmt(unique_ptr<Expr> e) : Stmt(StmtKind::EXPR), expr(move(e)) {}
 };
 
-struct EmptyStmt : Stmt {};
-
-// 语句列表（不创建新作用域，用于多变量声明）
-struct StmtList : Stmt {
-    vector<unique_ptr<Stmt>> stmts;
+struct EmptyStmt : Stmt {
+    EmptyStmt() : Stmt(StmtKind::EMPTY) {}
 };
 
 struct Param : ASTNode {
@@ -257,7 +258,6 @@ struct FuncDef : ASTNode {
 };
 
 struct Program : ASTNode {
-    vector<unique_ptr<GlobalVar>> globals;
     vector<unique_ptr<FuncDef>> functions;
 };
 
@@ -277,37 +277,11 @@ private:
     unique_ptr<Program> parseProgram() {
         auto prog = make_unique<Program>();
         while (!isAtEnd()) {
-            if (check(TokenType::VOID)) {
+            if (check(TokenType::INT) || check(TokenType::VOID)) {
                 prog->functions.push_back(parseFuncDef());
                 continue;
             }
-
-            if (check(TokenType::INT)) {
-                // Lookahead: "int id(" => function, otherwise global variable declaration.
-                size_t savedPos = current;
-                consume(TokenType::INT);
-                Token nameTok = consume(TokenType::IDENT);
-                if (check(TokenType::LPAREN)) {
-                    current = savedPos;
-                    prog->functions.push_back(parseFuncDef());
-                    continue;
-                }
-
-                // Global variable(s): int a = 1, b;
-                auto addGlobal = [&](Token identTok) {
-                    unique_ptr<Expr> init = nullptr;
-                    if (match(TokenType::ASSIGN)) init = parseExpr();
-                    else init = make_unique<NumberExpr>(0);
-                    prog->globals.push_back(make_unique<GlobalVar>(identTok.value, move(init)));
-                };
-
-                addGlobal(nameTok);
-                while (match(TokenType::COMMA)) addGlobal(consume(TokenType::IDENT));
-                consume(TokenType::SEMICOLON);
-                continue;
-            }
-
-            throw runtime_error("Expected top-level declaration");
+            throw runtime_error("Expected function definition");
         }
         return prog;
     }
@@ -366,25 +340,11 @@ private:
             return stmt;
         }
         if (match(TokenType::INT)) {
-            // 支持 int x; 或 int x = expr; 或 int x, y, z;
-            auto stmtList = make_unique<StmtList>();
-            do {
-                string name = consume(TokenType::IDENT).value;
-                unique_ptr<Expr> init = nullptr;
-                if (match(TokenType::ASSIGN)) {
-                    init = parseExpr();
-                } else {
-                    // 默认初始化为0
-                    init = make_unique<NumberExpr>(0);
-                }
-                stmtList->stmts.push_back(make_unique<VarDeclStmt>(name, move(init)));
-            } while (match(TokenType::COMMA));
+            string name = consume(TokenType::IDENT).value;
+            consume(TokenType::ASSIGN);
+            auto init = parseExpr();
             consume(TokenType::SEMICOLON);
-            // 如果只有一个声明，直接返回它
-            if (stmtList->stmts.size() == 1) {
-                return move(stmtList->stmts[0]);
-            }
-            return stmtList;
+            return make_unique<VarDeclStmt>(name, move(init));
         }
         if (check(TokenType::IDENT) && current + 1 < tokens.size() && tokens[current + 1].type == TokenType::ASSIGN) {
             string name = consume(TokenType::IDENT).value;
@@ -393,67 +353,12 @@ private:
             consume(TokenType::SEMICOLON);
             return make_unique<AssignStmt>(name, move(val));
         }
-        // 复合赋值: x += expr 等价于 x = x + expr
-        if (check(TokenType::IDENT) && current + 1 < tokens.size()) {
-            TokenType nextType = tokens[current + 1].type;
-            string op;
-            if (nextType == TokenType::PLUS_ASSIGN) op = "+";
-            else if (nextType == TokenType::MINUS_ASSIGN) op = "-";
-            else if (nextType == TokenType::STAR_ASSIGN) op = "*";
-            else if (nextType == TokenType::SLASH_ASSIGN) op = "/";
-            else if (nextType == TokenType::MOD_ASSIGN) op = "%";
-
-            if (!op.empty()) {
-                string name = consume(TokenType::IDENT).value;
-                current++;  // 跳过复合赋值运算符
-                auto rhs = parseExpr();
-                consume(TokenType::SEMICOLON);
-                // 构造 x = x op rhs
-                auto left = make_unique<IdentExpr>(name);
-                auto binExpr = make_unique<BinaryExpr>(op, move(left), move(rhs));
-                return make_unique<AssignStmt>(name, move(binExpr));
-            }
-        }
         auto expr = parseExpr();
         consume(TokenType::SEMICOLON);
         return make_unique<ExprStmt>(move(expr));
     }
 
-    unique_ptr<Expr> parseExpr() { return parseAssign(); }
-
-    // 赋值表达式 (右结合)
-    unique_ptr<Expr> parseAssign() {
-        // 保存当前位置以便回溯
-        size_t savedPos = current;
-
-        if (check(TokenType::IDENT)) {
-            string name = tokens[current].value;
-            current++;
-
-            // assignment operators (right-associative)
-            if (match(TokenType::ASSIGN)) {
-                auto value = parseAssign();  // 右结合
-                return make_unique<AssignExpr>(name, move(value));
-            }
-
-            string op;
-            if (match(TokenType::PLUS_ASSIGN)) op = "+";
-            else if (match(TokenType::MINUS_ASSIGN)) op = "-";
-            else if (match(TokenType::STAR_ASSIGN)) op = "*";
-            else if (match(TokenType::SLASH_ASSIGN)) op = "/";
-            else if (match(TokenType::MOD_ASSIGN)) op = "%";
-
-            if (!op.empty()) {
-                auto rhs = parseAssign();
-                auto left = make_unique<IdentExpr>(name);
-                auto binExpr = make_unique<BinaryExpr>(op, move(left), move(rhs));
-                return make_unique<AssignExpr>(name, move(binExpr));
-            }
-            // 不是赋值，回溯
-            current = savedPos;
-        }
-        return parseLOr();
-    }
+    unique_ptr<Expr> parseExpr() { return parseLOr(); }
 
     unique_ptr<Expr> parseLOr() {
         auto left = parseLAnd();
@@ -549,12 +454,8 @@ private:
     int labelCount = 0;
     int stackOffset = 0;
     int frameSize = 0;
-    string currentFunc;
     vector<string> breakLabels;
     vector<string> continueLabels;
-
-    set<string> globalVars;
-    map<string, int> globalInitValues;
 
     // 变量名 -> 栈偏移（相对于s0的负偏移）
     vector<map<string, int>> varScopes;
@@ -565,58 +466,6 @@ private:
 
     void emit(const string& s) { out << "\t" << s << "\n"; }
     void emitLabel(const string& s) { out << s << ":\n"; }
-
-    int evalConstExpr(Expr* expr) {
-        if (auto* num = dynamic_cast<NumberExpr*>(expr)) return num->value;
-
-        if (auto* unary = dynamic_cast<UnaryExpr*>(expr)) {
-            int operand = evalConstExpr(unary->operand.get());
-            if (unary->op == "+") return operand;
-            if (unary->op == "-") return -operand;
-            if (unary->op == "!") return operand == 0 ? 1 : 0;
-            throw runtime_error("Unsupported unary operator in global initializer");
-        }
-
-        if (auto* binary = dynamic_cast<BinaryExpr*>(expr)) {
-            if (binary->op == "&&") {
-                int left = evalConstExpr(binary->left.get());
-                if (left == 0) return 0;
-                int right = evalConstExpr(binary->right.get());
-                return right != 0 ? 1 : 0;
-            }
-
-            if (binary->op == "||") {
-                int left = evalConstExpr(binary->left.get());
-                if (left != 0) return 1;
-                int right = evalConstExpr(binary->right.get());
-                return right != 0 ? 1 : 0;
-            }
-
-            int left = evalConstExpr(binary->left.get());
-            int right = evalConstExpr(binary->right.get());
-
-            if (binary->op == "+") return left + right;
-            if (binary->op == "-") return left - right;
-            if (binary->op == "*") return left * right;
-            if (binary->op == "/") {
-                if (right == 0) throw runtime_error("Division by zero in global initializer");
-                return left / right;
-            }
-            if (binary->op == "%") {
-                if (right == 0) throw runtime_error("Modulo by zero in global initializer");
-                return left % right;
-            }
-            if (binary->op == "<") return left < right ? 1 : 0;
-            if (binary->op == ">") return left > right ? 1 : 0;
-            if (binary->op == "<=") return left <= right ? 1 : 0;
-            if (binary->op == ">=") return left >= right ? 1 : 0;
-            if (binary->op == "==") return left == right ? 1 : 0;
-            if (binary->op == "!=") return left != right ? 1 : 0;
-            throw runtime_error("Unsupported binary operator in global initializer");
-        }
-
-        throw runtime_error("Non-constant global initializer");
-    }
 
     // 分配栈空间给变量，返回偏移
     int allocVar(const string& name) {
@@ -640,52 +489,45 @@ private:
             return 0;  // 参数存在特定位置
         }
         // 查找全局变量
-        if (globalVars.count(name)) {
-            paramIdx = -2;
-            return 0;
-        }
         throw runtime_error("Undefined variable: " + name);
     }
 
     // 生成表达式，结果存入t0
+    // 优化：使用 switch + static_cast 替代 dynamic_cast，避免 RTTI 开销
     void genExpr(Expr* expr) {
-        if (auto* num = dynamic_cast<NumberExpr*>(expr)) {
+        switch (expr->kind) {
+        case ExprKind::NUMBER: {
+            auto* num = static_cast<NumberExpr*>(expr);
             emit("li t0, " + to_string(num->value));
-            return;
+            break;
         }
-
-        if (auto* ident = dynamic_cast<IdentExpr*>(expr)) {
+        case ExprKind::IDENT: {
+            auto* ident = static_cast<IdentExpr*>(expr);
             int paramIdx;
             int offset = lookupVar(ident->name, paramIdx);
-            if (paramIdx == -2) {
-                emit("la t1, " + ident->name);
-                emit("lw t0, 0(t1)");
-            } else if (paramIdx >= 0) {
+            if (paramIdx >= 0) {
                 if (paramIdx < 8) {
-                    // 参数 0-7 从帧中加载（保存自 a0-a7）
                     emit("lw t0, " + to_string(-12 - paramIdx * 4) + "(s0)");
                 } else {
-                    // 参数 8+ 从调用者栈上加载
                     emit("lw t0, " + to_string((paramIdx - 8) * 4) + "(s0)");
                 }
             } else {
                 emit("lw t0, " + to_string(offset) + "(s0)");
             }
-            return;
+            break;
         }
-
-        if (auto* unary = dynamic_cast<UnaryExpr*>(expr)) {
+        case ExprKind::UNARY: {
+            auto* unary = static_cast<UnaryExpr*>(expr);
             genExpr(unary->operand.get());
             if (unary->op == "-") {
                 emit("neg t0, t0");
             } else if (unary->op == "!") {
                 emit("seqz t0, t0");
             }
-            // +x 不需要处理
-            return;
+            break;
         }
-
-        if (auto* binary = dynamic_cast<BinaryExpr*>(expr)) {
+        case ExprKind::BINARY: {
+            auto* binary = static_cast<BinaryExpr*>(expr);
             // 短路求值
             if (binary->op == "&&") {
                 string falseLabel = newLabel();
@@ -699,9 +541,8 @@ private:
                 emitLabel(falseLabel);
                 emit("li t0, 0");
                 emitLabel(endLabel);
-                return;
+                break;
             }
-
             if (binary->op == "||") {
                 string trueLabel = newLabel();
                 string endLabel = newLabel();
@@ -714,9 +555,8 @@ private:
                 emitLabel(trueLabel);
                 emit("li t0, 1");
                 emitLabel(endLabel);
-                return;
+                break;
             }
-
             // 普通二元运算
             genExpr(binary->left.get());
             emit("addi sp, sp, -4");
@@ -737,103 +577,71 @@ private:
             else if (binary->op == ">=") { emit("slt t0, t0, t1"); emit("xori t0, t0, 1"); }
             else if (binary->op == "==") { emit("sub t0, t0, t1"); emit("seqz t0, t0"); }
             else if (binary->op == "!=") { emit("sub t0, t0, t1"); emit("snez t0, t0"); }
-            return;
+            break;
         }
-
-        if (auto* call = dynamic_cast<CallExpr*>(expr)) {
+        case ExprKind::CALL: {
+            auto* call = static_cast<CallExpr*>(expr);
             int argCount = call->args.size();
             int stackArgs = (argCount > 8) ? (argCount - 8) : 0;
 
             if (argCount > 0) {
-                // 分配临时空间 + 栈上参数空间
                 int tempSpace = argCount * 4;
                 int stackArgsSpace = stackArgs * 4;
                 emit("addi sp, sp, -" + to_string(tempSpace + stackArgsSpace));
 
-                // 计算并保存所有参数到临时空间
                 for (int i = 0; i < argCount; i++) {
                     genExpr(call->args[i].get());
                     emit("sw t0, " + to_string(stackArgsSpace + i * 4) + "(sp)");
                 }
 
-                // 加载前8个到参数寄存器
                 for (int i = 0; i < argCount && i < 8; i++) {
                     emit("lw a" + to_string(i) + ", " + to_string(stackArgsSpace + i * 4) + "(sp)");
                 }
 
-                // 把超过8个的参数复制到栈参数区（sp 附近）
                 for (int i = 8; i < argCount; i++) {
                     emit("lw t0, " + to_string(stackArgsSpace + i * 4) + "(sp)");
                     emit("sw t0, " + to_string((i - 8) * 4) + "(sp)");
                 }
 
-                // 释放临时空间，保留栈参数空间
                 emit("addi sp, sp, " + to_string(tempSpace));
             }
 
             emit("call " + call->funcName);
 
-            // 释放栈上参数空间
             if (stackArgs > 0) {
                 emit("addi sp, sp, " + to_string(stackArgs * 4));
             }
             emit("mv t0, a0");
-            return;
+            break;
         }
-
-        // 赋值表达式 (结果是赋值后的值)
-        if (auto* assignExpr = dynamic_cast<AssignExpr*>(expr)) {
-            genExpr(assignExpr->value.get());
-            int paramIdx;
-            int offset = lookupVar(assignExpr->name, paramIdx);
-            if (paramIdx == -2) {
-                emit("la t1, " + assignExpr->name);
-                emit("sw t0, 0(t1)");
-            } else if (paramIdx >= 0) {
-                if (paramIdx < 8) {
-                    emit("sw t0, " + to_string(-12 - paramIdx * 4) + "(s0)");
-                } else {
-                    emit("sw t0, " + to_string((paramIdx - 8) * 4) + "(s0)");
-                }
-            } else {
-                emit("sw t0, " + to_string(offset) + "(s0)");
-            }
-            // t0 仍然保存赋值的值，可以用于链式赋值
-            return;
         }
     }
 
+    // 优化：使用 switch + static_cast 替代 dynamic_cast
     void genStmt(Stmt* stmt) {
-        if (auto* block = dynamic_cast<BlockStmt*>(stmt)) {
+        switch (stmt->kind) {
+        case StmtKind::BLOCK: {
+            auto* block = static_cast<BlockStmt*>(stmt);
             varScopes.push_back({});
             for (auto& s : block->stmts) genStmt(s.get());
             varScopes.pop_back();
-            return;
+            break;
         }
-
-        if (dynamic_cast<EmptyStmt*>(stmt)) return;
-
-        // StmtList 不创建新作用域（用于多变量声明）
-        if (auto* stmtList = dynamic_cast<StmtList*>(stmt)) {
-            for (auto& s : stmtList->stmts) genStmt(s.get());
-            return;
-        }
-
-        if (auto* varDecl = dynamic_cast<VarDeclStmt*>(stmt)) {
+        case StmtKind::EMPTY:
+            break;
+        case StmtKind::VARDECL: {
+            auto* varDecl = static_cast<VarDeclStmt*>(stmt);
             genExpr(varDecl->init.get());
             int offset = allocVar(varDecl->name);
             emit("sw t0, " + to_string(offset) + "(s0)");
-            return;
+            break;
         }
-
-        if (auto* assign = dynamic_cast<AssignStmt*>(stmt)) {
+        case StmtKind::ASSIGN: {
+            auto* assign = static_cast<AssignStmt*>(stmt);
             genExpr(assign->value.get());
             int paramIdx;
             int offset = lookupVar(assign->name, paramIdx);
-            if (paramIdx == -2) {
-                emit("la t1, " + assign->name);
-                emit("sw t0, 0(t1)");
-            } else if (paramIdx >= 0) {
+            if (paramIdx >= 0) {
                 if (paramIdx < 8) {
                     emit("sw t0, " + to_string(-12 - paramIdx * 4) + "(s0)");
                 } else {
@@ -842,10 +650,10 @@ private:
             } else {
                 emit("sw t0, " + to_string(offset) + "(s0)");
             }
-            return;
+            break;
         }
-
-        if (auto* ifStmt = dynamic_cast<IfStmt*>(stmt)) {
+        case StmtKind::IF: {
+            auto* ifStmt = static_cast<IfStmt*>(stmt);
             string elseLabel = newLabel();
             string endLabel = newLabel();
             genExpr(ifStmt->cond.get());
@@ -857,10 +665,10 @@ private:
                 genStmt(ifStmt->elseStmt.get());
                 emitLabel(endLabel);
             }
-            return;
+            break;
         }
-
-        if (auto* whileStmt = dynamic_cast<WhileStmt*>(stmt)) {
+        case StmtKind::WHILE: {
+            auto* whileStmt = static_cast<WhileStmt*>(stmt);
             string condLabel = newLabel();
             string endLabel = newLabel();
             breakLabels.push_back(endLabel);
@@ -873,20 +681,16 @@ private:
             emitLabel(endLabel);
             breakLabels.pop_back();
             continueLabels.pop_back();
-            return;
+            break;
         }
-
-        if (dynamic_cast<BreakStmt*>(stmt)) {
+        case StmtKind::BREAK:
             emit("j " + breakLabels.back());
-            return;
-        }
-
-        if (dynamic_cast<ContinueStmt*>(stmt)) {
+            break;
+        case StmtKind::CONTINUE:
             emit("j " + continueLabels.back());
-            return;
-        }
-
-        if (auto* ret = dynamic_cast<ReturnStmt*>(stmt)) {
+            break;
+        case StmtKind::RETURN: {
+            auto* ret = static_cast<ReturnStmt*>(stmt);
             if (ret->value) {
                 genExpr(ret->value.get());
                 emit("mv a0, t0");
@@ -895,12 +699,13 @@ private:
             emit("lw s0, " + to_string(frameSize - 8) + "(sp)");
             emit("addi sp, sp, " + to_string(frameSize));
             emit("ret");
-            return;
+            break;
         }
-
-        if (auto* exprStmt = dynamic_cast<ExprStmt*>(stmt)) {
+        case StmtKind::EXPR: {
+            auto* exprStmt = static_cast<ExprStmt*>(stmt);
             genExpr(exprStmt->expr.get());
-            return;
+            break;
+        }
         }
     }
 
@@ -909,8 +714,6 @@ private:
         int count = 0;
         if (auto* block = dynamic_cast<BlockStmt*>(stmt)) {
             for (auto& s : block->stmts) count += countLocalVars(s.get());
-        } else if (auto* stmtList = dynamic_cast<StmtList*>(stmt)) {
-            for (auto& s : stmtList->stmts) count += countLocalVars(s.get());
         } else if (dynamic_cast<VarDeclStmt*>(stmt)) {
             count = 1;
         } else if (auto* ifStmt = dynamic_cast<IfStmt*>(stmt)) {
@@ -923,7 +726,6 @@ private:
     }
 
     void genFunc(FuncDef* func) {
-        currentFunc = func->name;
         stackOffset = 0;
         paramIndex.clear();
         varScopes.clear();
@@ -967,37 +769,19 @@ private:
             genStmt(stmt.get());
         }
 
-        // 添加隐式返回（防止函数末尾没有return导致段错误）
-        emit("li a0, 0");  // 默认返回0
-        emit("lw ra, " + to_string(frameSize - 4) + "(sp)");
-        emit("lw s0, " + to_string(frameSize - 8) + "(sp)");
-        emit("addi sp, sp, " + to_string(frameSize));
-        emit("ret");
+        // void 函数可自然结束，补一个返回
+        if (func->isVoid) {
+            emit("lw ra, " + to_string(frameSize - 4) + "(sp)");
+            emit("lw s0, " + to_string(frameSize - 8) + "(sp)");
+            emit("addi sp, sp, " + to_string(frameSize));
+            emit("ret");
+        }
 
         out << "\n";
     }
 
 public:
     string generate(Program* prog) {
-        globalVars.clear();
-        globalInitValues.clear();
-
-        if (!prog->globals.empty()) {
-            out << ".data\n";
-            for (auto& global : prog->globals) {
-                if (globalVars.count(global->name)) throw runtime_error("Duplicate global variable: " + global->name);
-                globalVars.insert(global->name);
-
-                int initValue = evalConstExpr(global->init.get());
-                globalInitValues[global->name] = initValue;
-
-                out << ".globl " << global->name << "\n";
-                emitLabel(global->name);
-                out << "\t.word " << initValue << "\n";
-            }
-            out << "\n";
-        }
-
         out << ".text\n\n";
         for (auto& func : prog->functions) {
             genFunc(func.get());
