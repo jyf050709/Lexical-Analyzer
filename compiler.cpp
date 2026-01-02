@@ -5657,7 +5657,8 @@ int main(int argc, char* argv[]) {
     // 解析命令行参数
     for (int i = 1; i < argc; i++) {
         if (string(argv[i]) == "-opt") {
-            g_optimize = true;
+            // 暂时禁用优化以排查问题
+            g_optimize = false;
         }
     }
 
