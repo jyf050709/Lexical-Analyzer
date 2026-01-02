@@ -4483,6 +4483,20 @@ private:
             break;
         case StmtKind::RETURN: {
             auto* ret = static_cast<ReturnStmt*>(stmt);
+
+            // 尾调用优化：检测是否是对当前函数的尾递归调用
+            if (g_optimize && tailCallOptEnabled && ret->value &&
+                ret->value->kind == ExprKind::CALL) {
+                auto* call = static_cast<CallExpr*>(ret->value.get());
+                if (call->funcName == currentFuncName &&
+                    (int)call->args.size() == currentParamCount) {
+                    // 这是一个尾递归调用，优化为跳转
+                    genTailCall(call);
+                    break;
+                }
+            }
+
+            // 常规返回
             if (ret->value) {
                 genExpr(ret->value.get());
                 emit("mv a0, t0");
@@ -4605,6 +4619,11 @@ private:
 
         // 设置局部变量起始偏移（跳过 ra、s0、sRegs 和参数）
         stackOffset = paramStartOffset - 4 - paramCount * 4;
+
+        // 尾调用入口标签（尾递归调用时跳转到这里）
+        if (g_optimize && tailCallOptEnabled) {
+            emitLabel(funcEntryLabel);
+        }
 
         // 生成函数体
         for (auto& stmt : func->body->stmts) {
