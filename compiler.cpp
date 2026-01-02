@@ -1149,6 +1149,7 @@ private:
 
     // 检查表达式是否是循环不变量
     bool isLoopInvariant(Expr* expr, const set<string>& modifiedVars) {
+        if (!expr) return true;
         switch (expr->kind) {
         case ExprKind::NUMBER:
             return true;
@@ -2271,6 +2272,7 @@ private:
 
     // 检查函数是否包含递归调用
     bool hasRecursiveCall(Stmt* stmt, const string& funcName) {
+        if (!stmt) return false;
         switch (stmt->kind) {
         case StmtKind::BLOCK: {
             auto* b = static_cast<BlockStmt*>(stmt);
@@ -2307,6 +2309,7 @@ private:
     }
 
     bool hasRecursiveCallInExpr(Expr* expr, const string& funcName) {
+        if (!expr) return false;
         switch (expr->kind) {
         case ExprKind::CALL: {
             auto* c = static_cast<CallExpr*>(expr);
@@ -2381,6 +2384,7 @@ private:
 
     // 收集语句中定义的变量
     void collectDefinedVars(Stmt* stmt, set<string>& vars) {
+        if (!stmt) return;
         switch (stmt->kind) {
         case StmtKind::BLOCK: {
             auto* block = static_cast<BlockStmt*>(stmt);
@@ -2408,6 +2412,7 @@ private:
 
     // 在语句中进行变量重命名
     unique_ptr<Stmt> renameVarsInStmt(Stmt* stmt, map<string, string>& renameMap, const string& prefix) {
+        if (!stmt) return nullptr;
         switch (stmt->kind) {
         case StmtKind::BLOCK: {
             auto* block = static_cast<BlockStmt*>(stmt);
