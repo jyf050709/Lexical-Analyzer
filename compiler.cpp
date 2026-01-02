@@ -1817,7 +1817,10 @@ private:
             } else if (stmt->kind == StmtKind::WHILE) {
                 auto* w = static_cast<WhileStmt*>(stmt.get());
                 if (w->body->kind == StmtKind::BLOCK) {
-                    if (eliminateDeadVars(static_cast<BlockStmt*>(w->body.get())->stmts))
+                    // 收集循环条件中使用的变量，作为受保护变量传递给循环体
+                    set<string> condVars;
+                    collectUsedVars(w->cond.get(), condVars);
+                    if (eliminateDeadVarsExcept(static_cast<BlockStmt*>(w->body.get())->stmts, condVars))
                         changed = true;
                 }
             }
