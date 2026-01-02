@@ -1476,6 +1476,7 @@ private:
 
     // 检测归纳变量：形如 i = i + c 的变量
     void detectInductionVars(Stmt* stmt, map<string, int>& inductionVars) {
+        if (!stmt) return;
         switch (stmt->kind) {
         case StmtKind::BLOCK: {
             auto* block = static_cast<BlockStmt*>(stmt);
@@ -1618,6 +1619,7 @@ private:
                                       vector<unique_ptr<Stmt>>& preLoop,
                                       vector<unique_ptr<Stmt>>& inLoop,
                                       const map<string, int>& initVals) {
+        if (!stmt) return;
         switch (stmt->kind) {
         case StmtKind::BLOCK: {
             auto* block = static_cast<BlockStmt*>(stmt);
@@ -1751,6 +1753,7 @@ private:
 
     // 计算循环体语句数
     int countStmtsInBody(Stmt* stmt) {
+        if (!stmt) return 0;
         if (stmt->kind != StmtKind::BLOCK) return 1;
         auto* block = static_cast<BlockStmt*>(stmt);
         int count = 0;
@@ -2157,6 +2160,7 @@ private:
     }
 
     void countFuncCallsInStmt(Stmt* stmt) {
+        if (!stmt) return;
         switch (stmt->kind) {
         case StmtKind::BLOCK: {
             auto* block = static_cast<BlockStmt*>(stmt);
@@ -2201,6 +2205,7 @@ private:
     }
 
     bool checkRecursive(Stmt* stmt, const string& funcName) {
+        if (!stmt) return false;
         switch (stmt->kind) {
         case StmtKind::BLOCK: {
             auto* block = static_cast<BlockStmt*>(stmt);
@@ -2238,6 +2243,7 @@ private:
     }
 
     bool checkRecursiveExpr(Expr* expr, const string& funcName) {
+        if (!expr) return false;
         switch (expr->kind) {
         case ExprKind::UNARY:
             return checkRecursiveExpr(static_cast<UnaryExpr*>(expr)->operand.get(), funcName);
