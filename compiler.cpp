@@ -2710,7 +2710,6 @@ public:
             }
             if (!changed) break;
         }
-        return; // 测试到这里
 
         // 最后阶段：再次运行基础优化
         for (int round = 0; round < 5; round++) {
