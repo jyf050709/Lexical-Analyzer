@@ -2855,6 +2855,66 @@ private:
     // 变量使用频率统计
     map<string, int> varUseFreq;
 
+    // ========== 图着色寄存器分配数据结构 ==========
+    // 基本块
+    struct BasicBlock {
+        int id;
+        vector<Stmt*> statements;
+        set<int> successors;
+        set<int> predecessors;
+        set<string> USE;       // 使用集合（在定义前使用的变量）
+        set<string> DEF;       // 定义集合
+        set<string> liveIn;    // 块入口活跃变量
+        set<string> liveOut;   // 块出口活跃变量
+    };
+
+    // 控制流图
+    struct CFG {
+        vector<BasicBlock> blocks;
+        int entryBlockId = 0;
+    };
+
+    // 干涉图
+    struct InterferenceGraph {
+        set<string> nodes;                    // 所有变量
+        map<string, set<string>> edges;       // 邻接表
+        map<string, int> spillCost;           // 溢出代价
+
+        void addEdge(const string& u, const string& v) {
+            if (u != v) {
+                edges[u].insert(v);
+                edges[v].insert(u);
+            }
+        }
+
+        int getDegree(const string& var) const {
+            auto it = edges.find(var);
+            return it != edges.end() ? (int)it->second.size() : 0;
+        }
+
+        void removeNode(const string& var) {
+            // 复制邻居列表避免迭代时修改
+            set<string> neighbors = edges[var];
+            for (const string& neighbor : neighbors) {
+                edges[neighbor].erase(var);
+            }
+            edges.erase(var);
+            nodes.erase(var);
+        }
+
+        void clear() {
+            nodes.clear();
+            edges.clear();
+            spillCost.clear();
+        }
+    };
+
+    // 图着色成员变量
+    CFG currentCFG;
+    InterferenceGraph interferenceGraph;
+    set<string> spilledVars;              // 溢出变量集合
+    static constexpr int K = 6;           // 可用寄存器数量
+
     // ========== 寄存器分配器 ==========
     // 可用寄存器栈：t0-t6 共7个
     const char* tempRegs[7] = {"t0", "t1", "t2", "t3", "t4", "t5", "t6"};
@@ -3032,6 +3092,552 @@ private:
         }
     }
 
+    // ========== 图着色寄存器分配实现 ==========
+
+    // 收集表达式中的变量使用（用于USE集合）
+    void collectUseFromExpr(Expr* expr, set<string>& useSet, const set<string>& defSet) {
+        if (!expr) return;
+        switch (expr->kind) {
+        case ExprKind::IDENT: {
+            auto* ident = static_cast<IdentExpr*>(expr);
+            // 只有未在本块定义的变量才加入USE
+            if (defSet.find(ident->name) == defSet.end()) {
+                useSet.insert(ident->name);
+            }
+            break;
+        }
+        case ExprKind::UNARY:
+            collectUseFromExpr(static_cast<UnaryExpr*>(expr)->operand.get(), useSet, defSet);
+            break;
+        case ExprKind::BINARY: {
+            auto* b = static_cast<BinaryExpr*>(expr);
+            collectUseFromExpr(b->left.get(), useSet, defSet);
+            collectUseFromExpr(b->right.get(), useSet, defSet);
+            break;
+        }
+        case ExprKind::CALL: {
+            auto* c = static_cast<CallExpr*>(expr);
+            for (auto& arg : c->args) {
+                collectUseFromExpr(arg.get(), useSet, defSet);
+            }
+            break;
+        }
+        default:
+            break;
+        }
+    }
+
+    // 收集表达式中的所有变量（用于活跃性分析）
+    void addUsedVarsToLive(Expr* expr, set<string>& liveSet) {
+        if (!expr) return;
+        switch (expr->kind) {
+        case ExprKind::IDENT:
+            liveSet.insert(static_cast<IdentExpr*>(expr)->name);
+            break;
+        case ExprKind::UNARY:
+            addUsedVarsToLive(static_cast<UnaryExpr*>(expr)->operand.get(), liveSet);
+            break;
+        case ExprKind::BINARY: {
+            auto* b = static_cast<BinaryExpr*>(expr);
+            addUsedVarsToLive(b->left.get(), liveSet);
+            addUsedVarsToLive(b->right.get(), liveSet);
+            break;
+        }
+        case ExprKind::CALL: {
+            auto* c = static_cast<CallExpr*>(expr);
+            for (auto& arg : c->args) {
+                addUsedVarsToLive(arg.get(), liveSet);
+            }
+            break;
+        }
+        default:
+            break;
+        }
+    }
+
+    // 收集函数体中的所有局部变量
+    void collectVariables(Stmt* stmt, set<string>& vars) {
+        switch (stmt->kind) {
+        case StmtKind::BLOCK:
+            for (auto& s : static_cast<BlockStmt*>(stmt)->stmts) {
+                collectVariables(s.get(), vars);
+            }
+            break;
+        case StmtKind::VARDECL:
+            vars.insert(static_cast<VarDeclStmt*>(stmt)->name);
+            break;
+        case StmtKind::IF: {
+            auto* i = static_cast<IfStmt*>(stmt);
+            collectVariables(i->thenStmt.get(), vars);
+            if (i->elseStmt) collectVariables(i->elseStmt.get(), vars);
+            break;
+        }
+        case StmtKind::WHILE:
+            collectVariables(static_cast<WhileStmt*>(stmt)->body.get(), vars);
+            break;
+        default:
+            break;
+        }
+    }
+
+    // 从语句列表构建CFG
+    void buildCFGFromStmts(const vector<unique_ptr<Stmt>>& stmts,
+                           int& currentBlockId, int& nextBlockId,
+                           vector<int>& breakTargets, vector<int>& continueTargets) {
+        for (const auto& stmt : stmts) {
+            switch (stmt->kind) {
+            case StmtKind::VARDECL:
+            case StmtKind::ASSIGN:
+            case StmtKind::EXPR:
+            case StmtKind::EMPTY:
+                // 普通语句直接加入当前块
+                currentCFG.blocks[currentBlockId].statements.push_back(stmt.get());
+                break;
+
+            case StmtKind::IF: {
+                auto* ifStmt = static_cast<IfStmt*>(stmt.get());
+                // 条件判断是当前块的一部分
+                currentCFG.blocks[currentBlockId].statements.push_back(stmt.get());
+
+                // 创建then块
+                int thenBlockId = nextBlockId++;
+                currentCFG.blocks.push_back(BasicBlock{thenBlockId, {}, {}, {}, {}, {}, {}, {}});
+
+                // 创建else块（如果有）
+                int elseBlockId = ifStmt->elseStmt ? nextBlockId++ : -1;
+                if (elseBlockId >= 0) {
+                    currentCFG.blocks.push_back(BasicBlock{elseBlockId, {}, {}, {}, {}, {}, {}, {}});
+                }
+
+                // 创建合并块
+                int mergeBlockId = nextBlockId++;
+                currentCFG.blocks.push_back(BasicBlock{mergeBlockId, {}, {}, {}, {}, {}, {}, {}});
+
+                // 连接边：当前块 -> then块
+                currentCFG.blocks[currentBlockId].successors.insert(thenBlockId);
+                // 当前块 -> else块 或 merge块
+                if (elseBlockId >= 0) {
+                    currentCFG.blocks[currentBlockId].successors.insert(elseBlockId);
+                } else {
+                    currentCFG.blocks[currentBlockId].successors.insert(mergeBlockId);
+                }
+
+                // 处理then分支
+                int thenCurrent = thenBlockId;
+                if (ifStmt->thenStmt->kind == StmtKind::BLOCK) {
+                    auto* block = static_cast<BlockStmt*>(ifStmt->thenStmt.get());
+                    buildCFGFromStmts(block->stmts, thenCurrent, nextBlockId,
+                                      breakTargets, continueTargets);
+                } else {
+                    currentCFG.blocks[thenCurrent].statements.push_back(ifStmt->thenStmt.get());
+                }
+                currentCFG.blocks[thenCurrent].successors.insert(mergeBlockId);
+
+                // 处理else分支
+                if (elseBlockId >= 0) {
+                    int elseCurrent = elseBlockId;
+                    if (ifStmt->elseStmt->kind == StmtKind::BLOCK) {
+                        auto* block = static_cast<BlockStmt*>(ifStmt->elseStmt.get());
+                        buildCFGFromStmts(block->stmts, elseCurrent, nextBlockId,
+                                          breakTargets, continueTargets);
+                    } else {
+                        currentCFG.blocks[elseCurrent].statements.push_back(ifStmt->elseStmt.get());
+                    }
+                    currentCFG.blocks[elseCurrent].successors.insert(mergeBlockId);
+                }
+
+                currentBlockId = mergeBlockId;
+                break;
+            }
+
+            case StmtKind::WHILE: {
+                auto* whileStmt = static_cast<WhileStmt*>(stmt.get());
+
+                // 创建循环头块（条件检查）
+                int headerBlockId = nextBlockId++;
+                currentCFG.blocks.push_back(BasicBlock{headerBlockId, {}, {}, {}, {}, {}, {}, {}});
+
+                // 创建循环体块
+                int bodyBlockId = nextBlockId++;
+                currentCFG.blocks.push_back(BasicBlock{bodyBlockId, {}, {}, {}, {}, {}, {}, {}});
+
+                // 创建循环出口块
+                int exitBlockId = nextBlockId++;
+                currentCFG.blocks.push_back(BasicBlock{exitBlockId, {}, {}, {}, {}, {}, {}, {}});
+
+                // 连接边
+                currentCFG.blocks[currentBlockId].successors.insert(headerBlockId);
+                currentCFG.blocks[headerBlockId].statements.push_back(stmt.get());
+                currentCFG.blocks[headerBlockId].successors.insert(bodyBlockId);
+                currentCFG.blocks[headerBlockId].successors.insert(exitBlockId);
+
+                // 处理循环体（带break/continue上下文）
+                breakTargets.push_back(exitBlockId);
+                continueTargets.push_back(headerBlockId);
+
+                int bodyCurrent = bodyBlockId;
+                if (whileStmt->body->kind == StmtKind::BLOCK) {
+                    auto* block = static_cast<BlockStmt*>(whileStmt->body.get());
+                    buildCFGFromStmts(block->stmts, bodyCurrent, nextBlockId,
+                                      breakTargets, continueTargets);
+                } else {
+                    currentCFG.blocks[bodyCurrent].statements.push_back(whileStmt->body.get());
+                }
+                // 循环体回边到header
+                currentCFG.blocks[bodyCurrent].successors.insert(headerBlockId);
+
+                breakTargets.pop_back();
+                continueTargets.pop_back();
+
+                currentBlockId = exitBlockId;
+                break;
+            }
+
+            case StmtKind::BREAK:
+                currentCFG.blocks[currentBlockId].statements.push_back(stmt.get());
+                if (!breakTargets.empty()) {
+                    currentCFG.blocks[currentBlockId].successors.insert(breakTargets.back());
+                }
+                // break后的代码是死代码，创建新块
+                currentBlockId = nextBlockId++;
+                currentCFG.blocks.push_back(BasicBlock{currentBlockId, {}, {}, {}, {}, {}, {}, {}});
+                break;
+
+            case StmtKind::CONTINUE:
+                currentCFG.blocks[currentBlockId].statements.push_back(stmt.get());
+                if (!continueTargets.empty()) {
+                    currentCFG.blocks[currentBlockId].successors.insert(continueTargets.back());
+                }
+                // continue后的代码是死代码，创建新块
+                currentBlockId = nextBlockId++;
+                currentCFG.blocks.push_back(BasicBlock{currentBlockId, {}, {}, {}, {}, {}, {}, {}});
+                break;
+
+            case StmtKind::RETURN:
+                currentCFG.blocks[currentBlockId].statements.push_back(stmt.get());
+                // return后的代码是死代码，创建新块
+                currentBlockId = nextBlockId++;
+                currentCFG.blocks.push_back(BasicBlock{currentBlockId, {}, {}, {}, {}, {}, {}, {}});
+                break;
+
+            case StmtKind::BLOCK: {
+                auto* block = static_cast<BlockStmt*>(stmt.get());
+                buildCFGFromStmts(block->stmts, currentBlockId, nextBlockId,
+                                  breakTargets, continueTargets);
+                break;
+            }
+            }
+        }
+    }
+
+    // 构建控制流图
+    void buildCFG(FuncDef* func) {
+        currentCFG = CFG();
+        currentCFG.entryBlockId = 0;
+
+        // 创建入口块
+        currentCFG.blocks.push_back(BasicBlock{0, {}, {}, {}, {}, {}, {}, {}});
+
+        int currentBlockId = 0;
+        int nextBlockId = 1;
+        vector<int> breakTargets;
+        vector<int> continueTargets;
+
+        buildCFGFromStmts(func->body->stmts, currentBlockId, nextBlockId,
+                          breakTargets, continueTargets);
+
+        // 构建前驱关系
+        for (auto& block : currentCFG.blocks) {
+            for (int succId : block.successors) {
+                if (succId < (int)currentCFG.blocks.size()) {
+                    currentCFG.blocks[succId].predecessors.insert(block.id);
+                }
+            }
+        }
+    }
+
+    // 计算每个基本块的USE和DEF集合
+    void computeUseDef() {
+        for (auto& block : currentCFG.blocks) {
+            block.USE.clear();
+            block.DEF.clear();
+
+            for (Stmt* stmt : block.statements) {
+                switch (stmt->kind) {
+                case StmtKind::VARDECL: {
+                    auto* v = static_cast<VarDeclStmt*>(stmt);
+                    // 先收集初始化表达式中的使用
+                    collectUseFromExpr(v->init.get(), block.USE, block.DEF);
+                    // 然后标记定义
+                    block.DEF.insert(v->name);
+                    break;
+                }
+                case StmtKind::ASSIGN: {
+                    auto* a = static_cast<AssignStmt*>(stmt);
+                    // 收集右侧表达式中的使用
+                    collectUseFromExpr(a->value.get(), block.USE, block.DEF);
+                    // 标记定义
+                    block.DEF.insert(a->name);
+                    break;
+                }
+                case StmtKind::IF: {
+                    auto* i = static_cast<IfStmt*>(stmt);
+                    collectUseFromExpr(i->cond.get(), block.USE, block.DEF);
+                    break;
+                }
+                case StmtKind::WHILE: {
+                    auto* w = static_cast<WhileStmt*>(stmt);
+                    collectUseFromExpr(w->cond.get(), block.USE, block.DEF);
+                    break;
+                }
+                case StmtKind::RETURN: {
+                    auto* r = static_cast<ReturnStmt*>(stmt);
+                    if (r->value) {
+                        collectUseFromExpr(r->value.get(), block.USE, block.DEF);
+                    }
+                    break;
+                }
+                case StmtKind::EXPR: {
+                    auto* e = static_cast<ExprStmt*>(stmt);
+                    collectUseFromExpr(e->expr.get(), block.USE, block.DEF);
+                    break;
+                }
+                default:
+                    break;
+                }
+            }
+        }
+    }
+
+    // 迭代计算活跃变量
+    void computeLiveness() {
+        // 初始化
+        for (auto& block : currentCFG.blocks) {
+            block.liveIn.clear();
+            block.liveOut.clear();
+        }
+
+        bool changed = true;
+        while (changed) {
+            changed = false;
+
+            // 逆序遍历（后向数据流分析）
+            for (int i = (int)currentCFG.blocks.size() - 1; i >= 0; i--) {
+                auto& block = currentCFG.blocks[i];
+                set<string> oldLiveIn = block.liveIn;
+
+                // OUT[B] = Union of IN[S] for all successors S
+                block.liveOut.clear();
+                for (int succId : block.successors) {
+                    if (succId < (int)currentCFG.blocks.size()) {
+                        for (const string& var : currentCFG.blocks[succId].liveIn) {
+                            block.liveOut.insert(var);
+                        }
+                    }
+                }
+
+                // IN[B] = USE[B] ∪ (OUT[B] - DEF[B])
+                block.liveIn = block.USE;
+                for (const string& var : block.liveOut) {
+                    if (block.DEF.find(var) == block.DEF.end()) {
+                        block.liveIn.insert(var);
+                    }
+                }
+
+                if (block.liveIn != oldLiveIn) {
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    // 构建干涉图
+    void buildInterferenceGraph(FuncDef* func) {
+        interferenceGraph.clear();
+
+        // 收集所有局部变量
+        set<string> allVars;
+        collectVariables(func->body.get(), allVars);
+
+        // 排除参数
+        for (const auto& param : func->params) {
+            allVars.erase(param->name);
+        }
+
+        interferenceGraph.nodes = allVars;
+
+        // 初始化边和溢出代价
+        for (const string& var : allVars) {
+            interferenceGraph.edges[var] = {};
+            interferenceGraph.spillCost[var] = varUseFreq[var];
+        }
+
+        // 遍历每个基本块，细粒度计算干涉
+        for (const auto& block : currentCFG.blocks) {
+            set<string> currentLive = block.liveOut;
+
+            // 逆序处理语句
+            for (auto it = block.statements.rbegin(); it != block.statements.rend(); ++it) {
+                Stmt* stmt = *it;
+
+                switch (stmt->kind) {
+                case StmtKind::VARDECL: {
+                    auto* v = static_cast<VarDeclStmt*>(stmt);
+                    // 定义变量与所有当前活跃变量干涉
+                    if (allVars.count(v->name)) {
+                        for (const string& liveVar : currentLive) {
+                            if (allVars.count(liveVar)) {
+                                interferenceGraph.addEdge(v->name, liveVar);
+                            }
+                        }
+                    }
+                    // 从活跃集移除定义变量
+                    currentLive.erase(v->name);
+                    // 添加初始化中使用的变量
+                    addUsedVarsToLive(v->init.get(), currentLive);
+                    break;
+                }
+                case StmtKind::ASSIGN: {
+                    auto* a = static_cast<AssignStmt*>(stmt);
+                    // 赋值目标与活跃变量干涉
+                    if (allVars.count(a->name)) {
+                        for (const string& liveVar : currentLive) {
+                            if (allVars.count(liveVar)) {
+                                interferenceGraph.addEdge(a->name, liveVar);
+                            }
+                        }
+                    }
+                    // 添加右侧表达式使用的变量
+                    addUsedVarsToLive(a->value.get(), currentLive);
+                    break;
+                }
+                case StmtKind::IF:
+                    addUsedVarsToLive(static_cast<IfStmt*>(stmt)->cond.get(), currentLive);
+                    break;
+                case StmtKind::WHILE:
+                    addUsedVarsToLive(static_cast<WhileStmt*>(stmt)->cond.get(), currentLive);
+                    break;
+                case StmtKind::RETURN:
+                    if (static_cast<ReturnStmt*>(stmt)->value) {
+                        addUsedVarsToLive(static_cast<ReturnStmt*>(stmt)->value.get(), currentLive);
+                    }
+                    break;
+                case StmtKind::EXPR:
+                    addUsedVarsToLive(static_cast<ExprStmt*>(stmt)->expr.get(), currentLive);
+                    break;
+                default:
+                    break;
+                }
+            }
+        }
+    }
+
+    // 选择溢出候选
+    string selectSpillCandidate(const InterferenceGraph& graph) {
+        string bestCandidate = "";
+        double bestScore = 1e18;
+
+        for (const string& var : graph.nodes) {
+            int spillCost = graph.spillCost.count(var) ? graph.spillCost.at(var) : 1;
+            int degree = graph.getDegree(var);
+            // 优先溢出：低使用频率 / 高干涉度
+            double score = (degree > 0) ? (double)spillCost / degree : spillCost;
+
+            if (bestCandidate.empty() || score < bestScore) {
+                bestCandidate = var;
+                bestScore = score;
+            }
+        }
+
+        return bestCandidate;
+    }
+
+    // 执行图着色寄存器分配
+    void performGraphColoring() {
+        varToReg.clear();
+        usedSRegs.clear();
+        spilledVars.clear();
+
+        // 如果没有变量需要分配，直接返回
+        if (interferenceGraph.nodes.empty()) {
+            return;
+        }
+
+        // 工作副本
+        InterferenceGraph workGraph = interferenceGraph;
+
+        // 简化栈：(变量名, 是否为潜在溢出)
+        vector<pair<string, bool>> stack;
+
+        // 阶段1：简化 - 反复移除度数 < K 的节点
+        while (!workGraph.nodes.empty()) {
+            string toRemove = "";
+            bool isPotentialSpill = false;
+
+            // 查找度数 < K 的节点（先复制节点集合避免迭代中修改）
+            vector<string> nodeList(workGraph.nodes.begin(), workGraph.nodes.end());
+            for (const string& var : nodeList) {
+                if (workGraph.getDegree(var) < K) {
+                    toRemove = var;
+                    isPotentialSpill = false;
+                    break;
+                }
+            }
+
+            if (toRemove.empty()) {
+                // 没有低度数节点，选择溢出候选
+                toRemove = selectSpillCandidate(workGraph);
+                isPotentialSpill = true;
+            }
+
+            if (!toRemove.empty()) {
+                stack.push_back({toRemove, isPotentialSpill});
+                workGraph.removeNode(toRemove);
+            }
+        }
+
+        // 阶段2：着色 - 出栈并分配颜色
+        set<string> usedColors;
+        const char* sRegs[] = {"s1", "s2", "s3", "s4", "s5", "s6"};
+
+        while (!stack.empty()) {
+            auto [var, isPotentialSpill] = stack.back();
+            stack.pop_back();
+
+            // 收集邻居使用的颜色
+            set<string> neighborColors;
+            for (const string& neighbor : interferenceGraph.edges[var]) {
+                if (varToReg.count(neighbor)) {
+                    neighborColors.insert(varToReg[neighbor]);
+                }
+            }
+
+            // 找一个可用颜色
+            string assignedColor = "";
+            for (int i = 0; i < K; i++) {
+                if (neighborColors.find(sRegs[i]) == neighborColors.end()) {
+                    assignedColor = sRegs[i];
+                    break;
+                }
+            }
+
+            if (!assignedColor.empty()) {
+                varToReg[var] = assignedColor;
+                usedColors.insert(assignedColor);
+            } else {
+                // 无可用颜色，必须溢出
+                spilledVars.insert(var);
+            }
+        }
+
+        // 记录使用的callee-saved寄存器
+        for (int i = 0; i < K; i++) {
+            if (usedColors.count(sRegs[i])) {
+                usedSRegs.push_back(sRegs[i]);
+            }
+        }
+    }
+
     // 分析函数，收集优化所需信息
     void analyzeFunction(FuncDef* func) {
         // 重置分析状态
@@ -3039,6 +3645,7 @@ private:
         varUseFreq.clear();
         varToReg.clear();
         usedSRegs.clear();
+        spilledVars.clear();
 
         // 检查是否为叶函数
         for (auto& stmt : func->body->stmts) {
@@ -3053,25 +3660,42 @@ private:
             countVarUseInStmtGen(stmt.get());
         }
 
-        // 局部变量寄存器化：选择使用频率最高的变量分配到 s1-s6
+        // 图着色寄存器分配（带回退到贪心分配的安全检查）
         if (g_optimize && !varUseFreq.empty()) {
-            // 排序变量按使用频率
-            vector<pair<string, int>> sortedVars(varUseFreq.begin(), varUseFreq.end());
-            sort(sortedVars.begin(), sortedVars.end(),
-                 [](const pair<string, int>& a, const pair<string, int>& b) {
-                     return a.second > b.second;
-                 });
+            bool useGraphColoring = true;  // 启用图着色
 
-            // 分配 s1-s6 给使用频率最高的局部变量（不包括参数）
-            const char* sRegs[] = {"s1", "s2", "s3", "s4", "s5", "s6"};
-            int regIdx = 0;
-            for (auto& [varName, freq] : sortedVars) {
-                if (regIdx >= 6) break;
-                // 只分配给局部变量，不分配给参数
-                if (paramIndex.find(varName) == paramIndex.end() && freq >= 3) {
-                    varToReg[varName] = sRegs[regIdx];
-                    usedSRegs.push_back(sRegs[regIdx]);
-                    regIdx++;
+            if (useGraphColoring) {
+                // 1. 构建控制流图
+                buildCFG(func);
+
+                // 2. 计算USE/DEF集合
+                computeUseDef();
+
+                // 3. 活跃变量分析
+                computeLiveness();
+
+                // 4. 构建干涉图
+                buildInterferenceGraph(func);
+
+                // 5. 执行图着色
+                performGraphColoring();
+            } else {
+                // 回退：使用原始的贪心分配
+                vector<pair<string, int>> sortedVars(varUseFreq.begin(), varUseFreq.end());
+                sort(sortedVars.begin(), sortedVars.end(),
+                     [](const pair<string, int>& a, const pair<string, int>& b) {
+                         return a.second > b.second;
+                     });
+
+                const char* sRegs[] = {"s1", "s2", "s3", "s4", "s5", "s6"};
+                int regIdx = 0;
+                for (auto& [varName, freq] : sortedVars) {
+                    if (regIdx >= 6) break;
+                    if (paramIndex.find(varName) == paramIndex.end() && freq >= 3) {
+                        varToReg[varName] = sRegs[regIdx];
+                        usedSRegs.push_back(sRegs[regIdx]);
+                        regIdx++;
+                    }
                 }
             }
         }
