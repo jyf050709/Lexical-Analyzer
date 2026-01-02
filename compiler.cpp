@@ -2252,8 +2252,86 @@ private:
     }
 
     // 判断函数是否可内联 - 暂时禁用
+    // ==================== 激进函数内联 ====================
+    // 内联阈值配置
+    static const int MAX_INLINE_STMTS = 30;      // 最大内联函数语句数
+    static const int MAX_INLINE_DEPTH = 5;       // 最大内联深度
+    static const int ALWAYS_INLINE_STMTS = 10;   // 总是内联的小函数语句数
+
+    // 检查函数是否包含递归调用
+    bool hasRecursiveCall(Stmt* stmt, const string& funcName) {
+        switch (stmt->kind) {
+        case StmtKind::BLOCK: {
+            auto* b = static_cast<BlockStmt*>(stmt);
+            for (auto& s : b->stmts) {
+                if (hasRecursiveCall(s.get(), funcName)) return true;
+            }
+            return false;
+        }
+        case StmtKind::VARDECL:
+            return hasRecursiveCallInExpr(static_cast<VarDeclStmt*>(stmt)->init.get(), funcName);
+        case StmtKind::ASSIGN:
+            return hasRecursiveCallInExpr(static_cast<AssignStmt*>(stmt)->value.get(), funcName);
+        case StmtKind::IF: {
+            auto* i = static_cast<IfStmt*>(stmt);
+            if (hasRecursiveCallInExpr(i->cond.get(), funcName)) return true;
+            if (hasRecursiveCall(i->thenStmt.get(), funcName)) return true;
+            if (i->elseStmt && hasRecursiveCall(i->elseStmt.get(), funcName)) return true;
+            return false;
+        }
+        case StmtKind::WHILE: {
+            auto* w = static_cast<WhileStmt*>(stmt);
+            if (hasRecursiveCallInExpr(w->cond.get(), funcName)) return true;
+            return hasRecursiveCall(w->body.get(), funcName);
+        }
+        case StmtKind::RETURN: {
+            auto* r = static_cast<ReturnStmt*>(stmt);
+            return r->value && hasRecursiveCallInExpr(r->value.get(), funcName);
+        }
+        case StmtKind::EXPR:
+            return hasRecursiveCallInExpr(static_cast<ExprStmt*>(stmt)->expr.get(), funcName);
+        default:
+            return false;
+        }
+    }
+
+    bool hasRecursiveCallInExpr(Expr* expr, const string& funcName) {
+        switch (expr->kind) {
+        case ExprKind::CALL: {
+            auto* c = static_cast<CallExpr*>(expr);
+            if (c->funcName == funcName) return true;
+            for (auto& arg : c->args) {
+                if (hasRecursiveCallInExpr(arg.get(), funcName)) return true;
+            }
+            return false;
+        }
+        case ExprKind::UNARY:
+            return hasRecursiveCallInExpr(static_cast<UnaryExpr*>(expr)->operand.get(), funcName);
+        case ExprKind::BINARY: {
+            auto* b = static_cast<BinaryExpr*>(expr);
+            return hasRecursiveCallInExpr(b->left.get(), funcName) ||
+                   hasRecursiveCallInExpr(b->right.get(), funcName);
+        }
+        default:
+            return false;
+        }
+    }
+
+    // 判断函数是否可以内联
     bool canInline(FuncDef* func) {
-        return false;  // 暂时禁用函数内联
+        if (!func) return false;
+
+        // 不内联main函数
+        if (func->name == "main") return false;
+
+        // 检查是否递归
+        if (hasRecursiveCall(func->body.get(), func->name)) return false;
+
+        // 检查语句数
+        int stmtCount = countStmtsInBody(func->body.get());
+        if (stmtCount > MAX_INLINE_STMTS) return false;
+
+        return true;
     }
 
     // 在表达式中进行变量重命名
@@ -2804,6 +2882,39 @@ private:
         throw runtime_error("Undefined variable: " + name);
     }
 
+    // 生成表达式到指定寄存器（用于多寄存器分配）
+    void genExprToReg(Expr* expr, const string& targetReg) {
+        switch (expr->kind) {
+        case ExprKind::NUMBER: {
+            auto* num = static_cast<NumberExpr*>(expr);
+            emit("li " + targetReg + ", " + to_string(num->value));
+            break;
+        }
+        case ExprKind::IDENT: {
+            auto* ident = static_cast<IdentExpr*>(expr);
+            int paramIdx;
+            int offset = lookupVar(ident->name, paramIdx);
+            if (paramIdx >= 0) {
+                if (paramIdx < 8) {
+                    emit("lw " + targetReg + ", " + to_string(-12 - paramIdx * 4) + "(s0)");
+                } else {
+                    emit("lw " + targetReg + ", " + to_string((paramIdx - 8) * 4) + "(s0)");
+                }
+            } else {
+                emit("lw " + targetReg + ", " + to_string(offset) + "(s0)");
+            }
+            break;
+        }
+        default:
+            // 对于复杂表达式，先计算到t0，再移动到目标寄存器
+            genExpr(expr);
+            if (targetReg != "t0") {
+                emit("mv " + targetReg + ", t0");
+            }
+            break;
+        }
+    }
+
     // 生成表达式，结果存入t0
     // 优化：使用 switch + static_cast 替代 dynamic_cast，避免 RTTI 开销
     void genExpr(Expr* expr) {
@@ -3050,13 +3161,61 @@ private:
                     emit("srai t1, t0, 31");                       // 符号位
                     emit("srli t1, t1, " + to_string(32 - (int)log2(val))); // 调整值
                     emit("add t2, t0, t1");                        // 调整后的被除数
-                    emit("andi t2, t2, " + to_string(~(val - 1))); // 对齐到val的倍数
+                    int mask = ~(val - 1);
+                    if (mask >= -2048 && mask <= 2047) {
+                        emit("andi t2, t2, " + to_string(mask));   // 对齐到val的倍数
+                    } else {
+                        emit("li t1, " + to_string(mask));         // 掩码超出12位范围，用寄存器
+                        emit("and t2, t2, t1");
+                    }
                     emit("sub t0, t0, t2");                        // 原值减去对齐值
                     break;
                 }
             }
 
-            // 普通二元运算
+            // 普通二元运算 - 使用多寄存器分配器优化
+            if (g_optimize && !needSpill()) {
+                // 有足够寄存器，不需要压栈
+                string leftReg = allocReg();
+                genExprToReg(binary->left.get(), leftReg);
+
+                if (!needSpill()) {
+                    string rightReg = allocReg();
+                    genExprToReg(binary->right.get(), rightReg);
+
+                    // 使用两个寄存器进行运算，结果放回t0
+                    if (binary->op == "+") emit("add t0, " + leftReg + ", " + rightReg);
+                    else if (binary->op == "-") emit("sub t0, " + leftReg + ", " + rightReg);
+                    else if (binary->op == "*") emit("mul t0, " + leftReg + ", " + rightReg);
+                    else if (binary->op == "/") emit("div t0, " + leftReg + ", " + rightReg);
+                    else if (binary->op == "%") emit("rem t0, " + leftReg + ", " + rightReg);
+                    else if (binary->op == "<") emit("slt t0, " + leftReg + ", " + rightReg);
+                    else if (binary->op == ">") emit("slt t0, " + rightReg + ", " + leftReg);
+                    else if (binary->op == "<=") {
+                        emit("slt t0, " + rightReg + ", " + leftReg);
+                        emit("xori t0, t0, 1");
+                    }
+                    else if (binary->op == ">=") {
+                        emit("slt t0, " + leftReg + ", " + rightReg);
+                        emit("xori t0, t0, 1");
+                    }
+                    else if (binary->op == "==") {
+                        emit("sub t0, " + leftReg + ", " + rightReg);
+                        emit("seqz t0, t0");
+                    }
+                    else if (binary->op == "!=") {
+                        emit("sub t0, " + leftReg + ", " + rightReg);
+                        emit("snez t0, t0");
+                    }
+
+                    freeReg(); // 释放rightReg
+                    freeReg(); // 释放leftReg
+                    break;
+                }
+                freeReg(); // 回退leftReg分配
+            }
+
+            // 回退到栈保存方式（寄存器不足时）
             genExpr(binary->left.get());
             emit("addi sp, sp, -4");
             emit("sw t0, 0(sp)");
