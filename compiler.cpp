@@ -1922,6 +1922,7 @@ private:
 
     // 检查循环是否包含break/continue（用于判断是否可以安全展开）
     bool loopHasBreakContinue(Stmt* stmt) {
+        if (!stmt) return false;
         switch (stmt->kind) {
         case StmtKind::BLOCK: {
             auto* block = static_cast<BlockStmt*>(stmt);
@@ -2350,6 +2351,7 @@ private:
 
     // 在表达式中进行变量重命名
     unique_ptr<Expr> renameVarsInExpr(Expr* expr, const map<string, string>& renameMap) {
+        if (!expr) return nullptr;
         switch (expr->kind) {
         case ExprKind::NUMBER:
             return make_unique<NumberExpr>(static_cast<NumberExpr*>(expr)->value);
