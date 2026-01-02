@@ -23,7 +23,8 @@
       "Bash(timeout:*)",
       "Bash(git stash:*)",
       "Bash(./compiler_dbg.exe:*)",
-      "Bash(./compiler_o1.exe:*)"
+      "Bash(./compiler_o1.exe:*)",
+      "Bash(tee:*)"
     ],
     "deny": [],
     "ask": []

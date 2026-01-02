@@ -3008,24 +3008,25 @@ public:
             cseStmtList(func->body->stmts);
         }
 
-        // 第五阶段：尾递归优化（完整实现：支持 if/else 分支内的尾递归）
-        for (auto& func : prog->functions) {
-            tailRecursionId = 0;  // 重置尾递归 ID
-            optimizeTailRecursionComplete(func.get());
-        }
-
-        // 尾递归优化后运行基础优化（处理新生成的循环代码）
-        for (int round = 0; round < 5; round++) {
-            bool changed = false;
-            for (auto& func : prog->functions) {
-                constVars.clear();
-                copyVars.clear();
-                if (optimizeStmtList(func->body->stmts)) {
-                    changed = true;
-                }
-            }
-            if (!changed) break;
-        }
+        // 第五阶段：尾递归优化（AST级别 - 暂时禁用，使用代码生成器级别的尾调用优化）
+        // 注意：AST级别和代码生成器级别的尾递归优化是两种不同方法，暂时只用后者
+        // for (auto& func : prog->functions) {
+        //     tailRecursionId = 0;  // 重置尾递归 ID
+        //     optimizeTailRecursionComplete(func.get());
+        // }
+        //
+        // // 尾递归优化后运行基础优化（处理新生成的循环代码）
+        // for (int round = 0; round < 5; round++) {
+        //     bool changed = false;
+        //     for (auto& func : prog->functions) {
+        //         constVars.clear();
+        //         copyVars.clear();
+        //         if (optimizeStmtList(func->body->stmts)) {
+        //             changed = true;
+        //         }
+        //     }
+        //     if (!changed) break;
+        // }
 
         // 第六阶段：死变量消除
         for (int round = 0; round < 3; round++) {
