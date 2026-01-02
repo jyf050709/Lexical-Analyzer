@@ -3222,8 +3222,9 @@ public:
                     vector<unique_ptr<Stmt>> hoisted;
                     hoistLoopInvariants(static_cast<WhileStmt*>(stmts[i].get()), hoisted);
                     // 插入到循环前
-                    for (auto it = hoisted.rbegin(); it != hoisted.rend(); ++it) {
-                        stmts.insert(stmts.begin() + i, move(*it));
+                    // 保持 hoisted 的生成顺序，避免后生成的语句在先生成的临时变量声明前使用它们
+                    for (auto& stmt : hoisted) {
+                        stmts.insert(stmts.begin() + i, move(stmt));
                         i++;
                     }
                 }
