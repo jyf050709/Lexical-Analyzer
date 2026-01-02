@@ -1145,15 +1145,38 @@ private:
         stmts.push_back(move(whileStmt));
     }
 
+        // 检查语句是否必然终止（return/break/continue 或以终止语句结束的 block）
+    bool isTerminatingStmt(Stmt* stmt) {
+        if (!stmt) return false;
+        switch (stmt->kind) {
+        case StmtKind::RETURN:
+        case StmtKind::BREAK:
+        case StmtKind::CONTINUE:
+            return true;
+        case StmtKind::BLOCK: {
+            auto* block = static_cast<BlockStmt*>(stmt);
+            if (block->stmts.empty()) return false;
+            return isTerminatingStmt(block->stmts.back().get());
+        }
+        case StmtKind::IF: {
+            auto* ifStmt = static_cast<IfStmt*>(stmt);
+            // if-else 两边都终止时才算终止
+            if (!ifStmt->elseStmt) return false;
+            return isTerminatingStmt(ifStmt->thenStmt.get()) &&
+                   isTerminatingStmt(ifStmt->elseStmt.get());
+        }
+        default:
+            return false;
+        }
+    }
+
     // 优化语句列表，返回是否有修改
     bool optimizeStmtList(vector<unique_ptr<Stmt>>& stmts) {
         bool changed = false;
 
-        // 死代码消除：删除 return 后的语句
+        // 死代码消除：删除终止语句后的语句
         for (size_t i = 0; i < stmts.size(); i++) {
-            if (stmts[i]->kind == StmtKind::RETURN ||
-                stmts[i]->kind == StmtKind::BREAK ||
-                stmts[i]->kind == StmtKind::CONTINUE) {
+            if (isTerminatingStmt(stmts[i].get())) {
                 if (i + 1 < stmts.size()) {
                     stmts.erase(stmts.begin() + i + 1, stmts.end());
                     changed = true;
