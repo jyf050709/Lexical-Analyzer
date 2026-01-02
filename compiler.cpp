@@ -2820,7 +2820,8 @@ private:
             // 检查是否可以内联
             if (funcTable.count(call->funcName) && canInline(funcTable[call->funcName])) {
                 FuncDef* func = funcTable[call->funcName];
-                auto [inlinedStmts, resultVar] = inlineCall(call, func);
+                // 使用已递归处理过参数的新调用节点，避免丢失参数内联结果
+                auto [inlinedStmts, resultVar] = inlineCall(newCall.get(), func);
                 for (auto& s : inlinedStmts) preStmts.push_back(move(s));
                 return make_tuple(true, move(preStmts), make_unique<IdentExpr>(resultVar));
             }
@@ -3054,13 +3055,11 @@ public:
             cseStmtList(func->body->stmts);
         }
 
-        // 第五阶段：尾递归优化（AST级别 - 将尾递归转换为循环）
-        for (auto& func : prog->functions) {
-            tailRecursionId = 0;
-            optimizeTailRecursionComplete(func.get());
-        }
+        // 第五阶段：尾递归优化
+        // AST 级别的尾递归改写在本项目中容易与后续的死代码/死变量消除交互出错，
+        // 这里禁用该阶段，改为仅在后端生成阶段做尾调用优化（见 CodeGenerator::genTailCall）。
 
-        // 尾递归优化后运行基础优化（处理新生成的循环代码）
+        // CSE 后再运行一轮基础优化（清理临时变量、再次折叠）
         for (int round = 0; round < 5; round++) {
             bool changed = false;
             for (auto& func : prog->functions) {
@@ -3073,17 +3072,11 @@ public:
             if (!changed) break;
         }
 
-        // 第六阶段：死变量消除（对尾递归转换后的代码需特殊处理）
-        // 注意：循环变量不应被视为死变量
+        // 第六阶段：死变量消除
         for (int round = 0; round < 3; round++) {
             bool changed = false;
             for (auto& func : prog->functions) {
-                // 收集函数参数名，这些在尾递归优化后不应被删除
-                set<string> loopVars;
-                for (auto& p : func->params) {
-                    if (p) loopVars.insert(p->name);
-                }
-                if (eliminateDeadVarsExcept(func->body->stmts, loopVars)) {
+                if (eliminateDeadVars(func->body->stmts)) {
                     changed = true;
                 }
             }
@@ -3240,7 +3233,20 @@ private:
 
     string newLabel() { return "L" + to_string(labelCount++); }
 
-    void emit(const string& s) { out << "\t" << s << "\n"; }
+    void emit(const string& s) {
+        out << "\t" << s << "\n";
+
+        // 跟踪 sp 偏移（用于 call 前 16B 对齐）
+        static const string kPrefix = "addi sp, sp, ";
+        if (s.rfind(kPrefix, 0) == 0) {
+            const string immStr = s.substr(kPrefix.size());
+            try {
+                spDeltaBytes += stoi(immStr);
+            } catch (...) {
+                // 忽略无法解析的情况（理论上不会发生）
+            }
+        }
+    }
     void emitLabel(const string& s) { out << s << ":\n"; }
 
     // ========== 函数预分析：检测叶函数、统计变量使用 ==========
@@ -4009,6 +4015,153 @@ private:
         return 1;
     }
 
+    bool exprHasShortCircuitOp(Expr* expr) {
+        if (!expr) return false;
+        switch (expr->kind) {
+        case ExprKind::NUMBER:
+        case ExprKind::IDENT:
+            return false;
+        case ExprKind::UNARY:
+            return exprHasShortCircuitOp(static_cast<UnaryExpr*>(expr)->operand.get());
+        case ExprKind::BINARY: {
+            auto* b = static_cast<BinaryExpr*>(expr);
+            if (b->op == "&&" || b->op == "||") return true;
+            return exprHasShortCircuitOp(b->left.get()) || exprHasShortCircuitOp(b->right.get());
+        }
+        case ExprKind::CALL: {
+            auto* c = static_cast<CallExpr*>(expr);
+            for (auto& arg : c->args) {
+                if (exprHasShortCircuitOp(arg.get())) return true;
+            }
+            return false;
+        }
+        }
+        return false;
+    }
+
+    // ========== 表达式寄存器分配（Sethi-Ullman） ==========
+    // 仅用于无 CALL / 无短路逻辑的表达式，避免大量 lw/sw 临时压栈。
+    string genExprSUInternal(Expr* expr) {
+        if (!expr) return "t0";
+
+        switch (expr->kind) {
+        case ExprKind::NUMBER: {
+            string r = allocReg();
+            emit("li " + r + ", " + to_string(static_cast<NumberExpr*>(expr)->value));
+            return r;
+        }
+        case ExprKind::IDENT: {
+            string r = allocReg();
+            auto* ident = static_cast<IdentExpr*>(expr);
+            if (g_optimize && varToReg.count(ident->name)) {
+                const string& src = varToReg[ident->name];
+                if (src != r) emit("mv " + r + ", " + src);
+                return r;
+            }
+
+            int paramIdx;
+            int offset = lookupVar(ident->name, paramIdx);
+            if (paramIdx >= 0) {
+                int sRegSaveCount = usedSRegs.size();
+                int paramStartOffset = -8 - sRegSaveCount * 4;
+                if (paramIdx < 8) {
+                    emit("lw " + r + ", " + to_string(paramStartOffset - 4 - paramIdx * 4) + "(s0)");
+                } else {
+                    emit("lw " + r + ", " + to_string((paramIdx - 8) * 4) + "(s0)");
+                }
+            } else {
+                emit("lw " + r + ", " + to_string(offset) + "(s0)");
+            }
+            return r;
+        }
+        case ExprKind::UNARY: {
+            auto* u = static_cast<UnaryExpr*>(expr);
+            string r = genExprSUInternal(u->operand.get());
+            if (u->op == "-") emit("neg " + r + ", " + r);
+            else if (u->op == "!") emit("seqz " + r + ", " + r);
+            return r;
+        }
+        case ExprKind::BINARY: {
+            auto* b = static_cast<BinaryExpr*>(expr);
+
+            // SU 路径不处理短路逻辑
+            if (b->op == "&&" || b->op == "||") {
+                // 回退到现有实现（t0），再搬运到一个临时寄存器中
+                // 注意：该分支正常不会进入（上层已过滤），保守兜底。
+                genExpr(expr);
+                string r = allocReg();
+                if (r != "t0") emit("mv " + r + ", t0");
+                return r;
+            }
+
+            int leftSU = computeSU(b->left.get());
+            int rightSU = computeSU(b->right.get());
+            bool evalLeftFirst = (leftSU >= rightSU);
+
+            Expr* firstExpr = evalLeftFirst ? b->left.get() : b->right.get();
+            Expr* secondExpr = evalLeftFirst ? b->right.get() : b->left.get();
+
+            // 先算 SU 更高的一侧，保留其寄存器作为最终目的寄存器
+            string firstReg = genExprSUInternal(firstExpr);
+            string secondReg = genExprSUInternal(secondExpr);
+
+            const string& leftReg = evalLeftFirst ? firstReg : secondReg;
+            const string& rightReg = evalLeftFirst ? secondReg : firstReg;
+            const string& dstReg = firstReg;
+
+            if (b->op == "+") emit("add " + dstReg + ", " + leftReg + ", " + rightReg);
+            else if (b->op == "-") emit("sub " + dstReg + ", " + leftReg + ", " + rightReg);
+            else if (b->op == "*") emit("mul " + dstReg + ", " + leftReg + ", " + rightReg);
+            else if (b->op == "/") emit("div " + dstReg + ", " + leftReg + ", " + rightReg);
+            else if (b->op == "%") emit("rem " + dstReg + ", " + leftReg + ", " + rightReg);
+            else if (b->op == "<") emit("slt " + dstReg + ", " + leftReg + ", " + rightReg);
+            else if (b->op == ">") emit("slt " + dstReg + ", " + rightReg + ", " + leftReg);
+            else if (b->op == "<=") {
+                emit("slt " + dstReg + ", " + rightReg + ", " + leftReg);
+                emit("xori " + dstReg + ", " + dstReg + ", 1");
+            }
+            else if (b->op == ">=") {
+                emit("slt " + dstReg + ", " + leftReg + ", " + rightReg);
+                emit("xori " + dstReg + ", " + dstReg + ", 1");
+            }
+            else if (b->op == "==") {
+                emit("sub " + dstReg + ", " + leftReg + ", " + rightReg);
+                emit("seqz " + dstReg + ", " + dstReg);
+            }
+            else if (b->op == "!=") {
+                emit("sub " + dstReg + ", " + leftReg + ", " + rightReg);
+                emit("snez " + dstReg + ", " + dstReg);
+            } else {
+                // 未支持的操作符回退
+                genExpr(expr);
+                emit("mv " + dstReg + ", t0");
+            }
+
+            // secondReg 是后算出来的、位于寄存器栈顶，释放它
+            freeReg();
+            return dstReg;
+        }
+        case ExprKind::CALL: {
+            // 上层应已过滤 CALL，这里保守回退到现有实现
+            genExpr(expr);
+            string r = allocReg();
+            if (r != "t0") emit("mv " + r + ", t0");
+            return r;
+        }
+        }
+        return "t0";
+    }
+
+    void genExprSUToT0(Expr* expr) {
+        int savedTop = regStackTop;
+        regStackTop = 0;
+
+        string r = genExprSUInternal(expr);
+        if (r != "t0") emit("mv t0, " + r);
+        freeReg();           // 释放 r
+        regStackTop = savedTop;
+    }
+
     // 分配栈空间给变量，返回偏移
     int allocVar(const string& name) {
         stackOffset -= 4;
@@ -4386,6 +4539,12 @@ private:
                 break;
             }
 
+            // 复杂表达式：使用 Sethi-Ullman 寄存器分配，尽量避免压栈
+            if (g_optimize && !exprHasCall(expr) && !exprHasShortCircuitOp(expr) && computeSU(expr) <= 7) {
+                genExprSUToT0(expr);
+                break;
+            }
+
             // 回退到栈保存方式（复杂表达式时）
             genExpr(binary->left.get());
             emit("addi sp, sp, -4");
@@ -4413,32 +4572,46 @@ private:
             int argCount = call->args.size();
             int stackArgs = (argCount > 8) ? (argCount - 8) : 0;
 
-            if (argCount > 0) {
-                int tempSpace = argCount * 4;
-                int stackArgsSpace = stackArgs * 4;
-                emit("addi sp, sp, -" + to_string(tempSpace + stackArgsSpace));
+            int tempSpace = argCount * 4;          // 临时区：保存所有实参值
+            int stackArgsSpace = stackArgs * 4;    // 出参区：a8+ 的参数
+            int baseAlloc = tempSpace + stackArgsSpace;
 
+            // 保障 call 前 sp 16B 对齐（RISC-V ABI）
+            int rem = (spDeltaBytes - baseAlloc) % 16;
+            if (rem < 0) rem += 16;
+            int pad = rem;
+
+            int totalAlloc = baseAlloc + pad;
+
+            if (totalAlloc > 0) {
+                emit("addi sp, sp, -" + to_string(totalAlloc));
+            }
+
+            if (argCount > 0) {
+                int tempOffset = stackArgsSpace;
+
+                // 1) 依次求值并写入临时区（避免嵌套调用覆盖 a/t 寄存器）
                 for (int i = 0; i < argCount; i++) {
                     genExpr(call->args[i].get());
-                    emit("sw t0, " + to_string(stackArgsSpace + i * 4) + "(sp)");
+                    emit("sw t0, " + to_string(tempOffset + i * 4) + "(sp)");
                 }
 
+                // 2) 加载 a0-a7
                 for (int i = 0; i < argCount && i < 8; i++) {
-                    emit("lw a" + to_string(i) + ", " + to_string(stackArgsSpace + i * 4) + "(sp)");
+                    emit("lw a" + to_string(i) + ", " + to_string(tempOffset + i * 4) + "(sp)");
                 }
 
+                // 3) 复制 a8+ 到出参区（sp+0 开始）
                 for (int i = 8; i < argCount; i++) {
-                    emit("lw t0, " + to_string(stackArgsSpace + i * 4) + "(sp)");
+                    emit("lw t0, " + to_string(tempOffset + i * 4) + "(sp)");
                     emit("sw t0, " + to_string((i - 8) * 4) + "(sp)");
                 }
-
-                emit("addi sp, sp, " + to_string(tempSpace));
             }
 
             emit("call " + call->funcName);
 
-            if (stackArgs > 0) {
-                emit("addi sp, sp, " + to_string(stackArgs * 4));
+            if (totalAlloc > 0) {
+                emit("addi sp, sp, " + to_string(totalAlloc));
             }
             emit("mv t0, a0");
             break;
@@ -4673,10 +4846,10 @@ private:
         // 计算需要保存的 callee-saved 寄存器数量
         int sRegSaveCount = usedSRegs.size();
 
-        // ra + s0 + callee-saved寄存器 + 参数存储 + 局部变量 + 临时空间
+        // ra + s0 + callee-saved寄存器 + 参数存储 + 局部变量
         // 叶函数可以不保存 ra
         int raSpace = (g_optimize && currentFuncIsLeaf) ? 0 : 4;
-        int neededSpace = raSpace + 4 + sRegSaveCount * 4 + paramCount * 4 + localVarCount * 4 + 128;
+        int neededSpace = raSpace + 4 + sRegSaveCount * 4 + paramCount * 4 + localVarCount * 4;
         frameSize = ((neededSpace + 15) / 16) * 16;
 
         // 函数标签
