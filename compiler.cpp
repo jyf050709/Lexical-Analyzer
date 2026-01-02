@@ -1933,7 +1933,7 @@ private:
         int boundVal = 0;
         int step = 0;
         bool isLessThan = true;  // < vs <=
-        size_t initStmtIdx = 0;  // 初始化语句在stmts中的索引
+        size_t initStmtIdx = SIZE_MAX;  // 初始化语句在stmts中的索引，SIZE_MAX表示未找到
     };
 
     LoopInfo analyzeLoop(vector<unique_ptr<Stmt>>& stmts, size_t whileIdx) {
@@ -1957,17 +1957,17 @@ private:
         info.boundVal = static_cast<NumberExpr*>(cond->right.get())->value;
         info.isLessThan = (cond->op == "<");
 
-        // 向前查找初始化语句 int i = N
-        for (size_t i = whileIdx; i > 0; i--) {
-            if (stmts[i-1]->kind == StmtKind::VARDECL) {
-                auto* v = static_cast<VarDeclStmt*>(stmts[i-1].get());
-                if (v->name == info.inductionVar && v->init->kind == ExprKind::NUMBER) {
-                    info.initVal = static_cast<NumberExpr*>(v->init.get())->value;
-                    info.initStmtIdx = i - 1;
-                    break;
-                }
+        // 向前查找初始化语句 int i = N（必须紧邻while循环）
+        if (stmts[whileIdx - 1]->kind == StmtKind::VARDECL) {
+            auto* v = static_cast<VarDeclStmt*>(stmts[whileIdx - 1].get());
+            if (v->name == info.inductionVar && v->init->kind == ExprKind::NUMBER) {
+                info.initVal = static_cast<NumberExpr*>(v->init.get())->value;
+                info.initStmtIdx = whileIdx - 1;
             }
         }
+
+        // 如果没有找到紧邻的初始化语句，返回无效
+        if (info.initStmtIdx == SIZE_MAX) return info;
 
         // 检查循环体中是否有 i = i + step 形式的更新
         if (whileStmt->body->kind != StmtKind::BLOCK) return info;
@@ -2016,6 +2016,10 @@ private:
         if (bodySize * iters > MAX_UNROLLED_STMTS) return false;
 
         vector<unique_ptr<Stmt>> unrolled;
+
+        // 保留归纳变量的声明，初始化为最终值（循环结束后的值）
+        int finalVal = info.initVal + iters * info.step;
+        unrolled.push_back(make_unique<VarDeclStmt>(info.inductionVar, make_unique<NumberExpr>(finalVal)));
 
         for (int iter = 0; iter < iters; iter++) {
             int currentVal = info.initVal + iter * info.step;
@@ -2597,7 +2601,12 @@ private:
 
 public:
     void optimize(Program* prog) {
-        // 第一阶段：多轮基础优化
+        // 循环展开
+        for (auto& func : prog->functions) {
+            aggressiveLoopUnroll(func->body->stmts);
+        }
+
+        // 基础优化
         for (int round = 0; round < 10; round++) {
             bool changed = false;
             for (auto& func : prog->functions) {
@@ -2614,6 +2623,7 @@ public:
             }
             if (!changed) break;
         }
+        // 测试完成，继续后续优化
 
         // 函数内联阶段
         inlineFunctions(prog);
@@ -2630,7 +2640,7 @@ public:
             if (!changed) break;
         }
 
-        // 激进循环完全展开
+        // 再次循环展开（处理内联后产生的新循环）
         for (auto& func : prog->functions) {
             aggressiveLoopUnroll(func->body->stmts);
         }
@@ -2691,6 +2701,7 @@ public:
             }
             if (!changed) break;
         }
+        return; // 测试到这里
 
         // 最后阶段：再次运行基础优化
         for (int round = 0; round < 5; round++) {
