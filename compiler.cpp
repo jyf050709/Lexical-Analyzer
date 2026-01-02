@@ -881,6 +881,284 @@ private:
         return call->funcName == currentFunc;
     }
 
+    // ==================== 完整的尾递归优化 ====================
+
+    // 检查语句是否处于尾位置（尾调用检测的核心）
+    // 返回值：该语句是否在尾位置
+    bool isInTailPosition(Stmt* stmt, bool isLastInBlock) {
+        if (!stmt) return false;
+
+        switch (stmt->kind) {
+        case StmtKind::RETURN:
+            return true;  // return 语句总是在尾位置
+
+        case StmtKind::IF: {
+            // if 语句在尾位置当且仅当它是块的最后一条语句
+            // 且 then 和 else 分支的最后语句都在尾位置
+            if (!isLastInBlock) return false;
+            auto* ifStmt = static_cast<IfStmt*>(stmt);
+            // then 分支必须有尾位置的语句
+            bool thenTail = isStmtEndsWithTailPosition(ifStmt->thenStmt.get());
+            // 如果有 else 分支，它也必须有尾位置的语句
+            // 如果没有 else 分支，则不算尾位置（因为可能 fall through）
+            bool elseTail = ifStmt->elseStmt ? isStmtEndsWithTailPosition(ifStmt->elseStmt.get()) : false;
+            return thenTail && (ifStmt->elseStmt ? elseTail : false);
+        }
+
+        case StmtKind::BLOCK: {
+            // 块在尾位置当且仅当它是块的最后一条语句
+            // 且它的最后语句在尾位置
+            if (!isLastInBlock) return false;
+            return isStmtEndsWithTailPosition(stmt);
+        }
+
+        default:
+            return false;
+        }
+    }
+
+    // 检查语句是否以尾位置结束
+    bool isStmtEndsWithTailPosition(Stmt* stmt) {
+        if (!stmt) return false;
+
+        switch (stmt->kind) {
+        case StmtKind::RETURN:
+            return true;
+
+        case StmtKind::BLOCK: {
+            auto* block = static_cast<BlockStmt*>(stmt);
+            if (block->stmts.empty()) return false;
+            return isStmtEndsWithTailPosition(block->stmts.back().get());
+        }
+
+        case StmtKind::IF: {
+            auto* ifStmt = static_cast<IfStmt*>(stmt);
+            bool thenTail = isStmtEndsWithTailPosition(ifStmt->thenStmt.get());
+            bool elseTail = ifStmt->elseStmt ? isStmtEndsWithTailPosition(ifStmt->elseStmt.get()) : false;
+            // 两个分支都必须以尾位置结束
+            return thenTail && (ifStmt->elseStmt ? elseTail : false);
+        }
+
+        default:
+            return false;
+        }
+    }
+
+    // 收集所有尾调用位置
+    // 返回所有尾递归调用的 ReturnStmt 指针
+    void collectTailCalls(Stmt* stmt, bool isLast, vector<ReturnStmt*>& tailCalls) {
+        if (!stmt) return;
+
+        switch (stmt->kind) {
+        case StmtKind::RETURN: {
+            auto* ret = static_cast<ReturnStmt*>(stmt);
+            if (ret->value && ret->value->kind == ExprKind::CALL) {
+                auto* call = static_cast<CallExpr*>(ret->value.get());
+                if (call->funcName == currentFunc) {
+                    tailCalls.push_back(ret);
+                }
+            }
+            break;
+        }
+
+        case StmtKind::BLOCK: {
+            auto* block = static_cast<BlockStmt*>(stmt);
+            for (size_t i = 0; i < block->stmts.size(); i++) {
+                bool last = (i == block->stmts.size() - 1) && isLast;
+                collectTailCalls(block->stmts[i].get(), last, tailCalls);
+            }
+            break;
+        }
+
+        case StmtKind::IF: {
+            auto* ifStmt = static_cast<IfStmt*>(stmt);
+            // if 分支中的 return 可能是尾调用
+            collectTailCalls(ifStmt->thenStmt.get(), isLast, tailCalls);
+            if (ifStmt->elseStmt) {
+                collectTailCalls(ifStmt->elseStmt.get(), isLast, tailCalls);
+            }
+            break;
+        }
+
+        case StmtKind::WHILE: {
+            // while 循环内的 return 也可能是尾调用
+            auto* whileStmt = static_cast<WhileStmt*>(stmt);
+            collectTailCalls(whileStmt->body.get(), false, tailCalls);
+            break;
+        }
+
+        default:
+            break;
+        }
+    }
+
+    // 检查函数是否可以进行尾递归优化
+    bool canOptimizeTailRecursion(FuncDef* func) {
+        if (!func || !func->body) return false;
+        if (func->isVoid) return false;  // void 函数不处理
+        if (func->params.empty()) return false;  // 无参函数不优化（没有递归参数传递）
+
+        currentFunc = func->name;
+        currentParams.clear();
+        for (auto& p : func->params) {
+            if (p) currentParams.push_back(p->name);
+        }
+
+        // 收集尾调用
+        vector<ReturnStmt*> tailCalls;
+        for (size_t i = 0; i < func->body->stmts.size(); i++) {
+            bool isLast = (i == func->body->stmts.size() - 1);
+            collectTailCalls(func->body->stmts[i].get(), isLast, tailCalls);
+        }
+
+        return !tailCalls.empty();
+    }
+
+    // 用于跟踪尾递归转换的唯一ID
+    int tailRecursionId = 0;
+
+    // 将尾递归调用转换为参数赋值 + continue
+    // 返回：转换后的语句块
+    unique_ptr<Stmt> transformTailCall(ReturnStmt* ret, const string& loopLabel) {
+        if (!ret || !ret->value || ret->value->kind != ExprKind::CALL) {
+            return nullptr;
+        }
+
+        auto* call = static_cast<CallExpr*>(ret->value.get());
+        if (call->funcName != currentFunc) return nullptr;
+        if (call->args.size() != currentParams.size()) return nullptr;
+
+        auto block = make_unique<BlockStmt>();
+
+        // 1. 创建临时变量保存新的参数值（避免相互覆盖）
+        for (size_t i = 0; i < currentParams.size(); i++) {
+            string tmpName = "__tail_arg_" + to_string(tailRecursionId) + "_" + to_string(i);
+            auto cloned = cloneExpr(call->args[i].get());
+            if (!cloned) return nullptr;
+            block->stmts.push_back(make_unique<VarDeclStmt>(tmpName, move(cloned)));
+        }
+
+        // 2. 将临时变量赋值给参数
+        for (size_t i = 0; i < currentParams.size(); i++) {
+            string tmpName = "__tail_arg_" + to_string(tailRecursionId) + "_" + to_string(i);
+            block->stmts.push_back(make_unique<AssignStmt>(
+                currentParams[i], make_unique<IdentExpr>(tmpName)));
+        }
+
+        tailRecursionId++;
+
+        // 3. continue 回到循环开头
+        block->stmts.push_back(make_unique<ContinueStmt>());
+
+        return block;
+    }
+
+    // 递归转换语句中的尾递归调用
+    // 返回：是否进行了转换
+    bool transformTailCallsInStmt(unique_ptr<Stmt>& stmt) {
+        if (!stmt) return false;
+
+        switch (stmt->kind) {
+        case StmtKind::RETURN: {
+            auto* ret = static_cast<ReturnStmt*>(stmt.get());
+            if (ret->value && ret->value->kind == ExprKind::CALL) {
+                auto* call = static_cast<CallExpr*>(ret->value.get());
+                if (call->funcName == currentFunc &&
+                    call->args.size() == currentParams.size()) {
+                    // 是尾递归调用，转换它
+                    auto transformed = transformTailCall(ret, "");
+                    if (transformed) {
+                        stmt = move(transformed);
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+
+        case StmtKind::BLOCK: {
+            auto* block = static_cast<BlockStmt*>(stmt.get());
+            bool changed = false;
+            for (auto& s : block->stmts) {
+                if (transformTailCallsInStmt(s)) {
+                    changed = true;
+                }
+            }
+            return changed;
+        }
+
+        case StmtKind::IF: {
+            auto* ifStmt = static_cast<IfStmt*>(stmt.get());
+            bool changed = transformTailCallsInStmt(ifStmt->thenStmt);
+            if (ifStmt->elseStmt) {
+                if (transformTailCallsInStmt(ifStmt->elseStmt)) {
+                    changed = true;
+                }
+            }
+            return changed;
+        }
+
+        case StmtKind::WHILE: {
+            auto* whileStmt = static_cast<WhileStmt*>(stmt.get());
+            return transformTailCallsInStmt(whileStmt->body);
+        }
+
+        default:
+            return false;
+        }
+    }
+
+    // 完整的尾递归优化：将尾递归函数转换为循环
+    void optimizeTailRecursionComplete(FuncDef* func) {
+        if (!canOptimizeTailRecursion(func)) return;
+
+        auto& stmts = func->body->stmts;
+
+        // 创建新的函数体结构
+        // 1. 将参数复制到局部变量（用于循环内修改）
+        auto newBody = make_unique<BlockStmt>();
+
+        for (size_t i = 0; i < currentParams.size(); i++) {
+            // 创建参数的本地副本
+            string localName = "__param_" + currentParams[i];
+            newBody->stmts.push_back(make_unique<VarDeclStmt>(
+                localName, make_unique<IdentExpr>(currentParams[i])));
+        }
+
+        // 2. 创建 while(1) 循环
+        auto whileStmt = make_unique<WhileStmt>();
+        whileStmt->cond = make_unique<NumberExpr>(1);
+
+        // 3. 循环体：原来的函数体
+        auto loopBody = make_unique<BlockStmt>();
+
+        // 将原来的参数引用替换为本地副本
+        // 首先，克隆原来的语句
+        for (auto& s : stmts) {
+            loopBody->stmts.push_back(cloneStmt(s.get()));
+        }
+
+        // 4. 将本地参数名映射到原参数名
+        map<string, string> paramRename;
+        for (const auto& p : currentParams) {
+            paramRename["__param_" + p] = p;
+        }
+
+        // 5. 转换尾递归调用为参数赋值 + continue
+        for (auto& s : loopBody->stmts) {
+            transformTailCallsInStmt(s);
+        }
+
+        whileStmt->body = move(loopBody);
+        newBody->stmts.push_back(move(whileStmt));
+
+        // 替换函数体
+        stmts.clear();
+        for (auto& s : newBody->stmts) {
+            stmts.push_back(move(s));
+        }
+    }
+
     // 优化语句列表，返回是否有修改
     bool optimizeStmtList(vector<unique_ptr<Stmt>>& stmts) {
         bool changed = false;
@@ -1046,74 +1324,6 @@ private:
         }
 
         return changed;
-    }
-
-    // 尾递归优化
-    void optimizeTailRecursion(FuncDef* func) {
-        if (!func || !func->body) return;
-        if (func->isVoid) return;  // void 函数不处理
-
-        currentFunc = func->name;
-        currentParams.clear();
-        for (auto& p : func->params) {
-            if (p) currentParams.push_back(p->name);
-        }
-
-        if (currentParams.empty()) return;  // 无参数函数不优化
-
-        auto& stmts = func->body->stmts;
-        if (stmts.empty()) return;
-
-        // 查找尾递归 return（只查找最后一条语句）
-        size_t lastIdx = stmts.size() - 1;
-        if (!isTailRecursiveReturn(stmts[lastIdx].get())) return;
-
-        // 转换为循环
-        auto* ret = static_cast<ReturnStmt*>(stmts[lastIdx].get());
-        if (!ret->value) return;
-        auto* call = static_cast<CallExpr*>(ret->value.get());
-        if (!call) return;
-
-        // 参数数量必须匹配
-        if (call->args.size() != currentParams.size()) return;
-
-        // 创建循环体
-        auto loopBody = make_unique<BlockStmt>();
-
-        // 克隆参数表达式到临时变量
-        for (size_t j = 0; j < currentParams.size(); j++) {
-            string tmpName = "__tail_tmp_" + to_string(j);
-            auto cloned = cloneExpr(call->args[j].get());
-            if (!cloned) return;  // 克隆失败，放弃优化
-            loopBody->stmts.push_back(make_unique<VarDeclStmt>(tmpName, move(cloned)));
-        }
-
-        // 将临时变量赋值给参数
-        for (size_t j = 0; j < currentParams.size(); j++) {
-            string tmpName = "__tail_tmp_" + to_string(j);
-            loopBody->stmts.push_back(make_unique<AssignStmt>(currentParams[j],
-                make_unique<IdentExpr>(tmpName)));
-        }
-
-        // 添加 continue
-        loopBody->stmts.push_back(make_unique<ContinueStmt>());
-
-        // 创建 while(1) 循环
-        auto whileStmt = make_unique<WhileStmt>();
-        whileStmt->cond = make_unique<NumberExpr>(1);
-
-        // 将原来的语句（除了最后的尾递归return）插入到循环体开头
-        for (size_t j = 0; j < lastIdx; j++) {
-            if (stmts[j]) {
-                loopBody->stmts.insert(loopBody->stmts.begin() + j, move(stmts[j]));
-            }
-        }
-
-        whileStmt->body = move(loopBody);
-
-        // 重构函数体
-        stmts.clear();
-        stmts.push_back(move(whileStmt));
     }
 
     // 收集循环内被修改的变量
@@ -2798,10 +3008,24 @@ public:
             cseStmtList(func->body->stmts);
         }
 
-        // 第五阶段：尾递归优化（暂时禁用 - 需要处理if分支内的尾递归）
-        // for (auto& func : prog->functions) {
-        //     optimizeTailRecursion(func.get());
-        // }
+        // 第五阶段：尾递归优化（完整实现：支持 if/else 分支内的尾递归）
+        for (auto& func : prog->functions) {
+            tailRecursionId = 0;  // 重置尾递归 ID
+            optimizeTailRecursionComplete(func.get());
+        }
+
+        // 尾递归优化后运行基础优化（处理新生成的循环代码）
+        for (int round = 0; round < 5; round++) {
+            bool changed = false;
+            for (auto& func : prog->functions) {
+                constVars.clear();
+                copyVars.clear();
+                if (optimizeStmtList(func->body->stmts)) {
+                    changed = true;
+                }
+            }
+            if (!changed) break;
+        }
 
         // 第六阶段：死变量消除
         for (int round = 0; round < 3; round++) {
