@@ -101,7 +101,8 @@ public:
                     id += peek();
                     advance();
                 }
-                addToken(keywords.count(id) ? keywords[id] : TokenType::IDENT, id);
+                auto it = keywords.find(id);
+                addToken(it != keywords.end() ? it->second : TokenType::IDENT, id);
                 continue;
             }
 
@@ -447,6 +448,639 @@ public:
     unique_ptr<Program> parse() { return parseProgram(); }
 };
 
+// ==================== 优化器（-opt 启用时使用） ====================
+class Optimizer {
+private:
+    // 常量传播表：变量名 -> 常量值
+    map<string, int> constVars;
+    // 复制传播表：变量名 -> 源变量名
+    map<string, string> copyVars;
+    // 变量使用计数
+    map<string, int> varUseCount;
+    // 当前函数名（用于尾递归检测）
+    string currentFunc;
+    // 当前函数参数
+    vector<string> currentParams;
+
+    // 检查表达式是否为常量
+    bool isConstExpr(Expr* expr) {
+        return expr->kind == ExprKind::NUMBER;
+    }
+
+    // 获取常量值
+    int getConstValue(Expr* expr) {
+        return static_cast<NumberExpr*>(expr)->value;
+    }
+
+    // 检查是否是2的幂
+    bool isPowerOfTwo(int n) {
+        return n > 0 && (n & (n - 1)) == 0;
+    }
+
+    // 获取log2值
+    int log2Int(int n) {
+        int r = 0;
+        while (n > 1) { n >>= 1; r++; }
+        return r;
+    }
+
+    // 深拷贝表达式
+    unique_ptr<Expr> cloneExpr(Expr* expr) {
+        switch (expr->kind) {
+        case ExprKind::NUMBER:
+            return make_unique<NumberExpr>(static_cast<NumberExpr*>(expr)->value);
+        case ExprKind::IDENT:
+            return make_unique<IdentExpr>(static_cast<IdentExpr*>(expr)->name);
+        case ExprKind::UNARY: {
+            auto* u = static_cast<UnaryExpr*>(expr);
+            return make_unique<UnaryExpr>(u->op, cloneExpr(u->operand.get()));
+        }
+        case ExprKind::BINARY: {
+            auto* b = static_cast<BinaryExpr*>(expr);
+            return make_unique<BinaryExpr>(b->op, cloneExpr(b->left.get()), cloneExpr(b->right.get()));
+        }
+        case ExprKind::CALL: {
+            auto* c = static_cast<CallExpr*>(expr);
+            auto newCall = make_unique<CallExpr>(c->funcName);
+            for (auto& arg : c->args) {
+                newCall->args.push_back(cloneExpr(arg.get()));
+            }
+            return newCall;
+        }
+        }
+        return nullptr;
+    }
+
+    // 表达式转字符串（用于公共子表达式消除）
+    string exprToString(Expr* expr) {
+        switch (expr->kind) {
+        case ExprKind::NUMBER:
+            return to_string(static_cast<NumberExpr*>(expr)->value);
+        case ExprKind::IDENT:
+            return static_cast<IdentExpr*>(expr)->name;
+        case ExprKind::UNARY: {
+            auto* u = static_cast<UnaryExpr*>(expr);
+            return "(" + u->op + exprToString(u->operand.get()) + ")";
+        }
+        case ExprKind::BINARY: {
+            auto* b = static_cast<BinaryExpr*>(expr);
+            return "(" + exprToString(b->left.get()) + b->op + exprToString(b->right.get()) + ")";
+        }
+        case ExprKind::CALL: {
+            auto* c = static_cast<CallExpr*>(expr);
+            string s = c->funcName + "(";
+            for (size_t i = 0; i < c->args.size(); i++) {
+                if (i > 0) s += ",";
+                s += exprToString(c->args[i].get());
+            }
+            return s + ")";
+        }
+        }
+        return "";
+    }
+
+    // 检查表达式是否使用了某个变量
+    bool exprUsesVar(Expr* expr, const string& var) {
+        switch (expr->kind) {
+        case ExprKind::NUMBER:
+            return false;
+        case ExprKind::IDENT:
+            return static_cast<IdentExpr*>(expr)->name == var;
+        case ExprKind::UNARY:
+            return exprUsesVar(static_cast<UnaryExpr*>(expr)->operand.get(), var);
+        case ExprKind::BINARY: {
+            auto* b = static_cast<BinaryExpr*>(expr);
+            return exprUsesVar(b->left.get(), var) || exprUsesVar(b->right.get(), var);
+        }
+        case ExprKind::CALL: {
+            auto* c = static_cast<CallExpr*>(expr);
+            for (auto& arg : c->args) {
+                if (exprUsesVar(arg.get(), var)) return true;
+            }
+            return false;
+        }
+        }
+        return false;
+    }
+
+    // 检查表达式是否包含函数调用（有副作用）
+    bool hasCallExpr(Expr* expr) {
+        switch (expr->kind) {
+        case ExprKind::NUMBER:
+        case ExprKind::IDENT:
+            return false;
+        case ExprKind::UNARY:
+            return hasCallExpr(static_cast<UnaryExpr*>(expr)->operand.get());
+        case ExprKind::BINARY: {
+            auto* b = static_cast<BinaryExpr*>(expr);
+            return hasCallExpr(b->left.get()) || hasCallExpr(b->right.get());
+        }
+        case ExprKind::CALL:
+            return true;
+        }
+        return false;
+    }
+
+    // 统计变量使用
+    void countVarUse(Expr* expr) {
+        switch (expr->kind) {
+        case ExprKind::IDENT:
+            varUseCount[static_cast<IdentExpr*>(expr)->name]++;
+            break;
+        case ExprKind::UNARY:
+            countVarUse(static_cast<UnaryExpr*>(expr)->operand.get());
+            break;
+        case ExprKind::BINARY: {
+            auto* b = static_cast<BinaryExpr*>(expr);
+            countVarUse(b->left.get());
+            countVarUse(b->right.get());
+            break;
+        }
+        case ExprKind::CALL: {
+            auto* c = static_cast<CallExpr*>(expr);
+            for (auto& arg : c->args) countVarUse(arg.get());
+            break;
+        }
+        default:
+            break;
+        }
+    }
+
+    void countVarUseInStmt(Stmt* stmt) {
+        switch (stmt->kind) {
+        case StmtKind::BLOCK: {
+            auto* block = static_cast<BlockStmt*>(stmt);
+            for (auto& s : block->stmts) countVarUseInStmt(s.get());
+            break;
+        }
+        case StmtKind::VARDECL: {
+            auto* v = static_cast<VarDeclStmt*>(stmt);
+            countVarUse(v->init.get());
+            break;
+        }
+        case StmtKind::ASSIGN: {
+            auto* a = static_cast<AssignStmt*>(stmt);
+            countVarUse(a->value.get());
+            break;
+        }
+        case StmtKind::IF: {
+            auto* i = static_cast<IfStmt*>(stmt);
+            countVarUse(i->cond.get());
+            countVarUseInStmt(i->thenStmt.get());
+            if (i->elseStmt) countVarUseInStmt(i->elseStmt.get());
+            break;
+        }
+        case StmtKind::WHILE: {
+            auto* w = static_cast<WhileStmt*>(stmt);
+            countVarUse(w->cond.get());
+            countVarUseInStmt(w->body.get());
+            break;
+        }
+        case StmtKind::RETURN: {
+            auto* r = static_cast<ReturnStmt*>(stmt);
+            if (r->value) countVarUse(r->value.get());
+            break;
+        }
+        case StmtKind::EXPR: {
+            auto* e = static_cast<ExprStmt*>(stmt);
+            countVarUse(e->expr.get());
+            break;
+        }
+        default:
+            break;
+        }
+    }
+
+    // 常量折叠 + 常量传播 + 复制传播 + 代数简化 + 强度削减
+    unique_ptr<Expr> foldExpr(Expr* expr) {
+        switch (expr->kind) {
+        case ExprKind::NUMBER:
+            return make_unique<NumberExpr>(static_cast<NumberExpr*>(expr)->value);
+
+        case ExprKind::IDENT: {
+            string name = static_cast<IdentExpr*>(expr)->name;
+            // 常量传播
+            if (constVars.count(name)) {
+                return make_unique<NumberExpr>(constVars[name]);
+            }
+            // 复制传播
+            if (copyVars.count(name)) {
+                string src = copyVars[name];
+                // 传递性复制传播
+                while (copyVars.count(src)) src = copyVars[src];
+                if (constVars.count(src)) {
+                    return make_unique<NumberExpr>(constVars[src]);
+                }
+                return make_unique<IdentExpr>(src);
+            }
+            return make_unique<IdentExpr>(name);
+        }
+
+        case ExprKind::UNARY: {
+            auto* unary = static_cast<UnaryExpr*>(expr);
+            auto operand = foldExpr(unary->operand.get());
+
+            if (operand->kind == ExprKind::NUMBER) {
+                int val = static_cast<NumberExpr*>(operand.get())->value;
+                if (unary->op == "-") return make_unique<NumberExpr>(-val);
+                if (unary->op == "!") return make_unique<NumberExpr>(val == 0 ? 1 : 0);
+                if (unary->op == "+") return make_unique<NumberExpr>(val);
+            }
+            // 双重否定消除: --x = x, !!x = (x != 0)
+            if (unary->op == "-" && operand->kind == ExprKind::UNARY) {
+                auto* inner = static_cast<UnaryExpr*>(operand.get());
+                if (inner->op == "-") {
+                    return cloneExpr(inner->operand.get());
+                }
+            }
+            return make_unique<UnaryExpr>(unary->op, move(operand));
+        }
+
+        case ExprKind::BINARY: {
+            auto* binary = static_cast<BinaryExpr*>(expr);
+            auto left = foldExpr(binary->left.get());
+            auto right = foldExpr(binary->right.get());
+
+            // 常量折叠
+            if (left->kind == ExprKind::NUMBER && right->kind == ExprKind::NUMBER) {
+                int l = static_cast<NumberExpr*>(left.get())->value;
+                int r = static_cast<NumberExpr*>(right.get())->value;
+                int result = 0;
+
+                if (binary->op == "+") result = l + r;
+                else if (binary->op == "-") result = l - r;
+                else if (binary->op == "*") result = l * r;
+                else if (binary->op == "/" && r != 0) result = l / r;
+                else if (binary->op == "%" && r != 0) result = l % r;
+                else if (binary->op == "<") result = l < r ? 1 : 0;
+                else if (binary->op == ">") result = l > r ? 1 : 0;
+                else if (binary->op == "<=") result = l <= r ? 1 : 0;
+                else if (binary->op == ">=") result = l >= r ? 1 : 0;
+                else if (binary->op == "==") result = l == r ? 1 : 0;
+                else if (binary->op == "!=") result = l != r ? 1 : 0;
+                else if (binary->op == "&&") result = (l && r) ? 1 : 0;
+                else if (binary->op == "||") result = (l || r) ? 1 : 0;
+                else {
+                    return make_unique<BinaryExpr>(binary->op, move(left), move(right));
+                }
+                return make_unique<NumberExpr>(result);
+            }
+
+            // 代数简化
+            if (binary->op == "+") {
+                // x + 0 = x
+                if (right->kind == ExprKind::NUMBER && getConstValue(right.get()) == 0)
+                    return left;
+                // 0 + x = x
+                if (left->kind == ExprKind::NUMBER && getConstValue(left.get()) == 0)
+                    return right;
+            }
+            if (binary->op == "-") {
+                // x - 0 = x
+                if (right->kind == ExprKind::NUMBER && getConstValue(right.get()) == 0)
+                    return left;
+                // x - x = 0
+                if (left->kind == ExprKind::IDENT && right->kind == ExprKind::IDENT &&
+                    static_cast<IdentExpr*>(left.get())->name == static_cast<IdentExpr*>(right.get())->name)
+                    return make_unique<NumberExpr>(0);
+            }
+            if (binary->op == "*") {
+                // x * 0 = 0
+                if (right->kind == ExprKind::NUMBER && getConstValue(right.get()) == 0)
+                    return make_unique<NumberExpr>(0);
+                if (left->kind == ExprKind::NUMBER && getConstValue(left.get()) == 0)
+                    return make_unique<NumberExpr>(0);
+                // x * 1 = x
+                if (right->kind == ExprKind::NUMBER && getConstValue(right.get()) == 1)
+                    return left;
+                if (left->kind == ExprKind::NUMBER && getConstValue(left.get()) == 1)
+                    return right;
+                // 强度削减: x * 2^n = x << n
+                if (right->kind == ExprKind::NUMBER) {
+                    int val = getConstValue(right.get());
+                    if (isPowerOfTwo(val)) {
+                        // 用加法代替乘以2: x * 2 = x + x
+                        if (val == 2) {
+                            return make_unique<BinaryExpr>("+", cloneExpr(left.get()), cloneExpr(left.get()));
+                        }
+                        // x * 4 = (x + x) + (x + x)
+                        if (val == 4) {
+                            auto x2 = make_unique<BinaryExpr>("+", cloneExpr(left.get()), cloneExpr(left.get()));
+                            return make_unique<BinaryExpr>("+", cloneExpr(x2.get()), move(x2));
+                        }
+                    }
+                }
+            }
+            if (binary->op == "/") {
+                // x / 1 = x
+                if (right->kind == ExprKind::NUMBER && getConstValue(right.get()) == 1)
+                    return left;
+                // x / x = 1 (assuming x != 0)
+                if (left->kind == ExprKind::IDENT && right->kind == ExprKind::IDENT &&
+                    static_cast<IdentExpr*>(left.get())->name == static_cast<IdentExpr*>(right.get())->name)
+                    return make_unique<NumberExpr>(1);
+            }
+            if (binary->op == "%") {
+                // x % 1 = 0
+                if (right->kind == ExprKind::NUMBER && getConstValue(right.get()) == 1)
+                    return make_unique<NumberExpr>(0);
+            }
+            // 短路求值优化
+            if (binary->op == "&&") {
+                if (left->kind == ExprKind::NUMBER) {
+                    if (getConstValue(left.get()) == 0) return make_unique<NumberExpr>(0);
+                    else return right;
+                }
+            }
+            if (binary->op == "||") {
+                if (left->kind == ExprKind::NUMBER) {
+                    if (getConstValue(left.get()) != 0) return make_unique<NumberExpr>(1);
+                    else return right;
+                }
+            }
+
+            return make_unique<BinaryExpr>(binary->op, move(left), move(right));
+        }
+
+        case ExprKind::CALL: {
+            auto* call = static_cast<CallExpr*>(expr);
+            auto newCall = make_unique<CallExpr>(call->funcName);
+            for (auto& arg : call->args) {
+                newCall->args.push_back(foldExpr(arg.get()));
+            }
+            return newCall;
+        }
+        }
+        return nullptr;
+    }
+
+    // 检查语句是否是尾递归调用
+    bool isTailRecursiveReturn(Stmt* stmt) {
+        if (stmt->kind != StmtKind::RETURN) return false;
+        auto* ret = static_cast<ReturnStmt*>(stmt);
+        if (!ret->value || ret->value->kind != ExprKind::CALL) return false;
+        auto* call = static_cast<CallExpr*>(ret->value.get());
+        return call->funcName == currentFunc;
+    }
+
+    // 优化语句列表，返回是否有修改
+    bool optimizeStmtList(vector<unique_ptr<Stmt>>& stmts) {
+        bool changed = false;
+
+        // 死代码消除：删除 return 后的语句
+        for (size_t i = 0; i < stmts.size(); i++) {
+            if (stmts[i]->kind == StmtKind::RETURN ||
+                stmts[i]->kind == StmtKind::BREAK ||
+                stmts[i]->kind == StmtKind::CONTINUE) {
+                if (i + 1 < stmts.size()) {
+                    stmts.erase(stmts.begin() + i + 1, stmts.end());
+                    changed = true;
+                }
+                break;
+            }
+        }
+
+        // 优化每条语句
+        for (auto it = stmts.begin(); it != stmts.end(); ) {
+            Stmt* stmt = it->get();
+
+            switch (stmt->kind) {
+            case StmtKind::BLOCK: {
+                auto* block = static_cast<BlockStmt*>(stmt);
+                optimizeStmtList(block->stmts);
+                // 空块消除
+                if (block->stmts.empty()) {
+                    it = stmts.erase(it);
+                    changed = true;
+                    continue;
+                }
+                break;
+            }
+            case StmtKind::EMPTY:
+                it = stmts.erase(it);
+                changed = true;
+                continue;
+
+            case StmtKind::VARDECL: {
+                auto* varDecl = static_cast<VarDeclStmt*>(stmt);
+                varDecl->init = foldExpr(varDecl->init.get());
+                // 记录常量
+                if (varDecl->init->kind == ExprKind::NUMBER) {
+                    constVars[varDecl->name] = getConstValue(varDecl->init.get());
+                }
+                // 记录复制
+                else if (varDecl->init->kind == ExprKind::IDENT) {
+                    copyVars[varDecl->name] = static_cast<IdentExpr*>(varDecl->init.get())->name;
+                }
+                break;
+            }
+            case StmtKind::ASSIGN: {
+                auto* assign = static_cast<AssignStmt*>(stmt);
+                assign->value = foldExpr(assign->value.get());
+                // 更新常量表
+                constVars.erase(assign->name);
+                copyVars.erase(assign->name);
+                if (assign->value->kind == ExprKind::NUMBER) {
+                    constVars[assign->name] = getConstValue(assign->value.get());
+                } else if (assign->value->kind == ExprKind::IDENT) {
+                    copyVars[assign->name] = static_cast<IdentExpr*>(assign->value.get())->name;
+                }
+                // 自赋值消除: x = x
+                if (assign->value->kind == ExprKind::IDENT &&
+                    static_cast<IdentExpr*>(assign->value.get())->name == assign->name) {
+                    it = stmts.erase(it);
+                    changed = true;
+                    continue;
+                }
+                break;
+            }
+            case StmtKind::IF: {
+                auto* ifStmt = static_cast<IfStmt*>(stmt);
+                ifStmt->cond = foldExpr(ifStmt->cond.get());
+
+                // 条件为常量：死代码消除
+                if (ifStmt->cond->kind == ExprKind::NUMBER) {
+                    int val = getConstValue(ifStmt->cond.get());
+                    if (val != 0) {
+                        // if(true) -> 只保留 then 分支
+                        *it = move(ifStmt->thenStmt);
+                        changed = true;
+                    } else {
+                        // if(false) -> 只保留 else 分支或删除
+                        if (ifStmt->elseStmt) {
+                            *it = move(ifStmt->elseStmt);
+                            changed = true;
+                        } else {
+                            it = stmts.erase(it);
+                            changed = true;
+                            continue;
+                        }
+                    }
+                } else {
+                    // 清除条件分支中的常量信息（保守分析）
+                    map<string, int> savedConst = constVars;
+                    map<string, string> savedCopy = copyVars;
+                    optimizeStmtList(static_cast<BlockStmt*>(ifStmt->thenStmt.get())->stmts);
+                    constVars = savedConst;
+                    copyVars = savedCopy;
+                    if (ifStmt->elseStmt) {
+                        if (ifStmt->elseStmt->kind == StmtKind::BLOCK) {
+                            optimizeStmtList(static_cast<BlockStmt*>(ifStmt->elseStmt.get())->stmts);
+                        }
+                    }
+                    constVars = savedConst;
+                    copyVars = savedCopy;
+                }
+                break;
+            }
+            case StmtKind::WHILE: {
+                auto* whileStmt = static_cast<WhileStmt*>(stmt);
+                whileStmt->cond = foldExpr(whileStmt->cond.get());
+
+                // while(0) 消除
+                if (whileStmt->cond->kind == ExprKind::NUMBER &&
+                    getConstValue(whileStmt->cond.get()) == 0) {
+                    it = stmts.erase(it);
+                    changed = true;
+                    continue;
+                }
+
+                // 循环内的优化（保守：清除循环体可能修改的变量）
+                constVars.clear();
+                copyVars.clear();
+                if (whileStmt->body->kind == StmtKind::BLOCK) {
+                    optimizeStmtList(static_cast<BlockStmt*>(whileStmt->body.get())->stmts);
+                }
+                break;
+            }
+            case StmtKind::RETURN: {
+                auto* ret = static_cast<ReturnStmt*>(stmt);
+                if (ret->value) ret->value = foldExpr(ret->value.get());
+                break;
+            }
+            case StmtKind::EXPR: {
+                auto* exprStmt = static_cast<ExprStmt*>(stmt);
+                exprStmt->expr = foldExpr(exprStmt->expr.get());
+                // 删除无副作用的表达式语句
+                if (!hasCallExpr(exprStmt->expr.get())) {
+                    it = stmts.erase(it);
+                    changed = true;
+                    continue;
+                }
+                break;
+            }
+            default:
+                break;
+            }
+            ++it;
+        }
+
+        return changed;
+    }
+
+    // 尾递归优化
+    void optimizeTailRecursion(FuncDef* func) {
+        if (func->isVoid) return;  // void 函数不处理
+
+        currentFunc = func->name;
+        currentParams.clear();
+        for (auto& p : func->params) {
+            currentParams.push_back(p->name);
+        }
+
+        auto& stmts = func->body->stmts;
+
+        // 查找尾递归 return
+        for (size_t i = 0; i < stmts.size(); i++) {
+            if (isTailRecursiveReturn(stmts[i].get())) {
+                // 转换为循环
+                auto* ret = static_cast<ReturnStmt*>(stmts[i].get());
+                auto* call = static_cast<CallExpr*>(ret->value.get());
+
+                // 创建循环体
+                auto loopBody = make_unique<BlockStmt>();
+
+                // 创建参数更新语句
+                vector<unique_ptr<Expr>> newArgs;
+                for (auto& arg : call->args) {
+                    newArgs.push_back(cloneExpr(arg.get()));
+                }
+
+                // 使用临时变量避免覆盖
+                for (size_t j = 0; j < currentParams.size() && j < newArgs.size(); j++) {
+                    string tmpName = "__tmp_" + to_string(j);
+                    loopBody->stmts.push_back(make_unique<VarDeclStmt>(tmpName, move(newArgs[j])));
+                }
+                for (size_t j = 0; j < currentParams.size() && j < call->args.size(); j++) {
+                    string tmpName = "__tmp_" + to_string(j);
+                    loopBody->stmts.push_back(make_unique<AssignStmt>(currentParams[j],
+                        make_unique<IdentExpr>(tmpName)));
+                }
+
+                // 创建 while(1) 循环
+                auto whileStmt = make_unique<WhileStmt>();
+                whileStmt->cond = make_unique<NumberExpr>(1);
+
+                // 将原来的语句移到循环体开头（除了尾递归 return）
+                auto outerBody = make_unique<BlockStmt>();
+                for (size_t j = 0; j < i; j++) {
+                    outerBody->stmts.push_back(move(stmts[j]));
+                }
+                // 添加 continue
+                loopBody->stmts.push_back(make_unique<ContinueStmt>());
+
+                // 组合循环体
+                for (auto& s : outerBody->stmts) {
+                    static_cast<BlockStmt*>(loopBody.get())->stmts.insert(
+                        static_cast<BlockStmt*>(loopBody.get())->stmts.begin(),
+                        move(s));
+                }
+
+                whileStmt->body = move(loopBody);
+
+                // 重构函数体
+                stmts.clear();
+                stmts.push_back(move(whileStmt));
+                break;
+            }
+        }
+    }
+
+public:
+    void optimize(Program* prog) {
+        // 多轮优化直到不再有变化
+        for (int round = 0; round < 5; round++) {
+            bool changed = false;
+            for (auto& func : prog->functions) {
+                constVars.clear();
+                copyVars.clear();
+
+                // 参数不是常量
+                for (auto& p : func->params) {
+                    constVars.erase(p->name);
+                }
+
+                if (optimizeStmtList(func->body->stmts)) {
+                    changed = true;
+                }
+            }
+            if (!changed) break;
+        }
+
+        // 尾递归优化（单独一轮）
+        for (auto& func : prog->functions) {
+            optimizeTailRecursion(func.get());
+        }
+
+        // 最后一轮常量折叠
+        for (auto& func : prog->functions) {
+            constVars.clear();
+            copyVars.clear();
+            optimizeStmtList(func->body->stmts);
+        }
+    }
+};
+
 // ==================== 代码生成器（直接生成汇编） ====================
 class CodeGenerator {
 private:
@@ -712,15 +1346,28 @@ private:
     // 计算函数需要的栈空间（遍历所有变量声明）
     int countLocalVars(Stmt* stmt) {
         int count = 0;
-        if (auto* block = dynamic_cast<BlockStmt*>(stmt)) {
+        switch (stmt->kind) {
+        case StmtKind::BLOCK: {
+            auto* block = static_cast<BlockStmt*>(stmt);
             for (auto& s : block->stmts) count += countLocalVars(s.get());
-        } else if (dynamic_cast<VarDeclStmt*>(stmt)) {
+            break;
+        }
+        case StmtKind::VARDECL:
             count = 1;
-        } else if (auto* ifStmt = dynamic_cast<IfStmt*>(stmt)) {
+            break;
+        case StmtKind::IF: {
+            auto* ifStmt = static_cast<IfStmt*>(stmt);
             count = countLocalVars(ifStmt->thenStmt.get());
             if (ifStmt->elseStmt) count += countLocalVars(ifStmt->elseStmt.get());
-        } else if (auto* whileStmt = dynamic_cast<WhileStmt*>(stmt)) {
+            break;
+        }
+        case StmtKind::WHILE: {
+            auto* whileStmt = static_cast<WhileStmt*>(stmt);
             count = countLocalVars(whileStmt->body.get());
+            break;
+        }
+        default:
+            break;
         }
         return count;
     }
@@ -792,6 +1439,13 @@ public:
 
 // ==================== 主函数 ====================
 int main(int argc, char* argv[]) {
+    // 解析命令行参数
+    for (int i = 1; i < argc; i++) {
+        if (string(argv[i]) == "-opt") {
+            g_optimize = true;
+        }
+    }
+
     string source, line;
     while (getline(cin, line)) source += line + "\n";
 
@@ -801,6 +1455,12 @@ int main(int argc, char* argv[]) {
 
         Parser parser(tokens);
         auto ast = parser.parse();
+
+        // 如果启用优化，执行常量折叠等优化
+        if (g_optimize) {
+            Optimizer optimizer;
+            optimizer.optimize(ast.get());
+        }
 
         CodeGenerator codeGen;
         cout << codeGen.generate(ast.get());
