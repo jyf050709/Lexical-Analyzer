@@ -4716,55 +4716,9 @@ private:
                 }
             }
 
-            // ========== 除法优化 ==========
-            if (g_optimize && binary->op == "/" && binary->right->kind == ExprKind::NUMBER) {
-                int val = static_cast<NumberExpr*>(binary->right.get())->value;
-                if (val > 0 && (val & (val - 1)) == 0) {
-                    genExpr(binary->left.get());
-                    int shift = 0;
-                    int tmp = val;
-                    while (tmp > 1) { tmp >>= 1; shift++; }
-
-                    // 有符号除法需要处理负数舍入
-                    if (shift > 0) {
-                        emit("srai t1, t0, 31");                       // 符号位扩展
-                        emit("srli t1, t1, " + to_string(32 - shift)); // 调整值
-                        emit("add t0, t0, t1");                        // 加偏移
-                    }
-                    emit("srai t0, t0, " + to_string(shift));
-                    break;
-                }
-            }
-
-            // ========== 取模优化 ==========
-            if (g_optimize && binary->op == "%" && binary->right->kind == ExprKind::NUMBER) {
-                int val = static_cast<NumberExpr*>(binary->right.get())->value;
-                if (val > 0 && (val & (val - 1)) == 0) {
-                    if (val == 1) {
-                        // x % 1 = 0
-                        emit("li t0, 0");
-                        break;
-                    }
-                    genExpr(binary->left.get());
-                    // 有符号取模需要特殊处理
-                    // x % n = x - (x / n) * n, 对于2的幂可以简化
-                    // 简化版本：对于非负数，直接用 andi
-                    // 完整版本：需要处理负数情况
-                    int shift = log2Int(val);
-                    emit("srai t1, t0, 31");                       // 符号位
-                    emit("srli t1, t1, " + to_string(32 - shift)); // 调整值
-                    emit("add t2, t0, t1");                        // 调整后的被除数
-                    int mask = ~(val - 1);
-                    if (mask >= -2048 && mask <= 2047) {
-                        emit("andi t2, t2, " + to_string(mask));   // 对齐到val的倍数
-                    } else {
-                        emit("li t1, " + to_string(mask));         // 掩码超出12位范围，用寄存器
-                        emit("and t2, t2, t1");
-                    }
-                    emit("sub t0, t0, t2");                        // 原值减去对齐值
-                    break;
-                }
-            }
+            // ========== 除法/取模优化（禁用）==========
+            // 这里曾对常量 2^k 的 / 和 % 做位运算替换，但在有符号/负数场景下很容易出错，
+            // 会导致评测出现“错误输出”。为保证语义正确性，这里直接回退到 div/rem。
 
             // 普通二元运算 - 使用多寄存器分配器优化
             // 只有当两个操作数都是简单表达式时才使用多寄存器
