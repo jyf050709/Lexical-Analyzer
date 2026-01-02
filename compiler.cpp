@@ -756,21 +756,7 @@ private:
                     return left;
                 if (left->kind == ExprKind::NUMBER && getConstValue(left.get()) == 1)
                     return right;
-                // 强度削减: x * 2^n = x << n
-                if (right->kind == ExprKind::NUMBER) {
-                    int val = getConstValue(right.get());
-                    if (isPowerOfTwo(val)) {
-                        // 用加法代替乘以2: x * 2 = x + x
-                        if (val == 2) {
-                            return make_unique<BinaryExpr>("+", cloneExpr(left.get()), cloneExpr(left.get()));
-                        }
-                        // x * 4 = (x + x) + (x + x)
-                        if (val == 4) {
-                            auto x2 = make_unique<BinaryExpr>("+", cloneExpr(left.get()), cloneExpr(left.get()));
-                            return make_unique<BinaryExpr>("+", cloneExpr(x2.get()), move(x2));
-                        }
-                    }
-                }
+                // 注：强度削减由归纳变量优化处理，这里不再做 x*2, x*4 的转换
             }
             if (binary->op == "/") {
                 // x / 1 = x
@@ -1234,25 +1220,12 @@ private:
             case StmtKind::IF: {
                 auto* i = static_cast<IfStmt*>(stmt.get());
                 i->cond = cseExpr(i->cond.get(), preStmts);
-                // 分支内的 CSE 需要独立处理
-                map<string, string> savedCse = cseMap;
-                if (i->thenStmt->kind == StmtKind::BLOCK) {
-                    cseStmtList(static_cast<BlockStmt*>(i->thenStmt.get())->stmts);
-                }
-                cseMap = savedCse;
-                if (i->elseStmt && i->elseStmt->kind == StmtKind::BLOCK) {
-                    cseStmtList(static_cast<BlockStmt*>(i->elseStmt.get())->stmts);
-                }
-                cseMap = savedCse;
+                // 分支内不进行CSE（保守策略，避免作用域问题）
                 break;
             }
             case StmtKind::WHILE: {
                 auto* w = static_cast<WhileStmt*>(stmt.get());
-                // 循环内清空 CSE（保守策略）
-                cseMap.clear();
-                if (w->body->kind == StmtKind::BLOCK) {
-                    cseStmtList(static_cast<BlockStmt*>(w->body.get())->stmts);
-                }
+                // 循环内不进行CSE（保守策略，避免作用域问题）
                 cseMap.clear();
                 break;
             }
