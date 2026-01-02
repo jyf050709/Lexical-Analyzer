@@ -1400,18 +1400,27 @@ private:
     bool eliminateDeadVars(vector<unique_ptr<Stmt>>& stmts) {
         bool changed = false;
 
-        // 收集所有使用的变量
+        // 收集所有使用的变量（在表达式右边被引用的变量）
         set<string> usedVars;
         for (auto& stmt : stmts) {
             collectUsedVarsInStmt(stmt.get(), usedVars);
         }
 
-        // 删除未使用变量的声明（如果初始化没有副作用）
+        // 删除未使用变量的声明和赋值
         for (auto it = stmts.begin(); it != stmts.end(); ) {
             if ((*it)->kind == StmtKind::VARDECL) {
                 auto* v = static_cast<VarDeclStmt*>(it->get());
                 if (usedVars.find(v->name) == usedVars.end() &&
                     !hasCallExpr(v->init.get())) {
+                    it = stmts.erase(it);
+                    changed = true;
+                    continue;
+                }
+            } else if ((*it)->kind == StmtKind::ASSIGN) {
+                // 如果赋值目标变量从未被使用（读取），删除该赋值
+                auto* a = static_cast<AssignStmt*>(it->get());
+                if (usedVars.find(a->name) == usedVars.end() &&
+                    !hasCallExpr(a->value.get())) {
                     it = stmts.erase(it);
                     changed = true;
                     continue;
