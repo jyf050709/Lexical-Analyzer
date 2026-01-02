@@ -4394,6 +4394,45 @@ private:
         }
     }
 
+    // ========== 尾调用优化：生成尾递归调用代码 ==========
+    // 将尾递归调用转换为参数更新 + 跳转
+    void genTailCall(CallExpr* call) {
+        int argCount = call->args.size();
+
+        if (argCount == 0) {
+            // 无参数，直接跳转
+            emit("j " + funcEntryLabel);
+            return;
+        }
+
+        // 1. 将所有新参数值计算并存储到临时栈空间
+        int tempSpace = argCount * 4;
+        emit("addi sp, sp, -" + to_string(tempSpace));
+
+        for (int i = 0; i < argCount; i++) {
+            genExpr(call->args[i].get());
+            emit("sw t0, " + to_string(i * 4) + "(sp)");
+        }
+
+        // 2. 将临时空间的值复制到参数寄存器位置
+        // 参数在栈上的位置: s0 - 8 - sRegsCount*4 - 4 - i*4
+        int sRegSaveCount = usedSRegs.size();
+        int paramStartOffset = -8 - sRegSaveCount * 4;
+
+        for (int i = 0; i < argCount && i < 8; i++) {
+            // 从临时空间加载到 a 寄存器
+            emit("lw a" + to_string(i) + ", " + to_string(i * 4) + "(sp)");
+            // 同时存储到参数在栈上的位置
+            emit("sw a" + to_string(i) + ", " + to_string(paramStartOffset - 4 - i * 4) + "(s0)");
+        }
+
+        // 3. 回收临时栈空间
+        emit("addi sp, sp, " + to_string(tempSpace));
+
+        // 4. 跳转到函数入口
+        emit("j " + funcEntryLabel);
+    }
+
     // 优化：使用 switch + static_cast 替代 dynamic_cast
     void genStmt(Stmt* stmt) {
         switch (stmt->kind) {
