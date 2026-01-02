@@ -1721,6 +1721,275 @@ private:
         }
     }
 
+    // 计算循环体语句数
+    int countStmtsInBody(Stmt* stmt) {
+        if (stmt->kind != StmtKind::BLOCK) return 1;
+        auto* block = static_cast<BlockStmt*>(stmt);
+        int count = 0;
+        for (auto& s : block->stmts) {
+            if (s->kind == StmtKind::BLOCK) {
+                count += countStmtsInBody(s.get());
+            } else {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    // 克隆语句
+    unique_ptr<Stmt> cloneStmt(Stmt* stmt) {
+        switch (stmt->kind) {
+        case StmtKind::BLOCK: {
+            auto* block = static_cast<BlockStmt*>(stmt);
+            auto newBlock = make_unique<BlockStmt>();
+            for (auto& s : block->stmts) {
+                newBlock->stmts.push_back(cloneStmt(s.get()));
+            }
+            return newBlock;
+        }
+        case StmtKind::VARDECL: {
+            auto* v = static_cast<VarDeclStmt*>(stmt);
+            return make_unique<VarDeclStmt>(v->name, cloneExpr(v->init.get()));
+        }
+        case StmtKind::ASSIGN: {
+            auto* a = static_cast<AssignStmt*>(stmt);
+            return make_unique<AssignStmt>(a->name, cloneExpr(a->value.get()));
+        }
+        case StmtKind::IF: {
+            auto* i = static_cast<IfStmt*>(stmt);
+            auto newIf = make_unique<IfStmt>();
+            newIf->cond = cloneExpr(i->cond.get());
+            newIf->thenStmt = cloneStmt(i->thenStmt.get());
+            if (i->elseStmt) newIf->elseStmt = cloneStmt(i->elseStmt.get());
+            return newIf;
+        }
+        case StmtKind::WHILE: {
+            auto* w = static_cast<WhileStmt*>(stmt);
+            auto newWhile = make_unique<WhileStmt>();
+            newWhile->cond = cloneExpr(w->cond.get());
+            newWhile->body = cloneStmt(w->body.get());
+            return newWhile;
+        }
+        case StmtKind::BREAK:
+            return make_unique<BreakStmt>();
+        case StmtKind::CONTINUE:
+            return make_unique<ContinueStmt>();
+        case StmtKind::RETURN: {
+            auto* r = static_cast<ReturnStmt*>(stmt);
+            if (r->value) return make_unique<ReturnStmt>(cloneExpr(r->value.get()));
+            return make_unique<ReturnStmt>();
+        }
+        case StmtKind::EXPR: {
+            auto* e = static_cast<ExprStmt*>(stmt);
+            return make_unique<ExprStmt>(cloneExpr(e->expr.get()));
+        }
+        case StmtKind::EMPTY:
+            return make_unique<EmptyStmt>();
+        }
+        return nullptr;
+    }
+
+    // 在表达式中替换变量为值
+    unique_ptr<Expr> substituteVar(Expr* expr, const string& varName, int value) {
+        switch (expr->kind) {
+        case ExprKind::NUMBER:
+            return make_unique<NumberExpr>(static_cast<NumberExpr*>(expr)->value);
+        case ExprKind::IDENT: {
+            auto* ident = static_cast<IdentExpr*>(expr);
+            if (ident->name == varName) {
+                return make_unique<NumberExpr>(value);
+            }
+            return make_unique<IdentExpr>(ident->name);
+        }
+        case ExprKind::UNARY: {
+            auto* u = static_cast<UnaryExpr*>(expr);
+            return make_unique<UnaryExpr>(u->op, substituteVar(u->operand.get(), varName, value));
+        }
+        case ExprKind::BINARY: {
+            auto* b = static_cast<BinaryExpr*>(expr);
+            return make_unique<BinaryExpr>(b->op,
+                substituteVar(b->left.get(), varName, value),
+                substituteVar(b->right.get(), varName, value));
+        }
+        case ExprKind::CALL: {
+            auto* c = static_cast<CallExpr*>(expr);
+            auto newCall = make_unique<CallExpr>(c->funcName);
+            for (auto& arg : c->args) {
+                newCall->args.push_back(substituteVar(arg.get(), varName, value));
+            }
+            return newCall;
+        }
+        }
+        return nullptr;
+    }
+
+    // 在语句中替换变量为值
+    unique_ptr<Stmt> substituteVarInStmt(Stmt* stmt, const string& varName, int value) {
+        switch (stmt->kind) {
+        case StmtKind::BLOCK: {
+            auto* block = static_cast<BlockStmt*>(stmt);
+            auto newBlock = make_unique<BlockStmt>();
+            for (auto& s : block->stmts) {
+                newBlock->stmts.push_back(substituteVarInStmt(s.get(), varName, value));
+            }
+            return newBlock;
+        }
+        case StmtKind::VARDECL: {
+            auto* v = static_cast<VarDeclStmt*>(stmt);
+            return make_unique<VarDeclStmt>(v->name, substituteVar(v->init.get(), varName, value));
+        }
+        case StmtKind::ASSIGN: {
+            auto* a = static_cast<AssignStmt*>(stmt);
+            if (a->name == varName) {
+                // 跳过对归纳变量的赋值
+                return make_unique<EmptyStmt>();
+            }
+            return make_unique<AssignStmt>(a->name, substituteVar(a->value.get(), varName, value));
+        }
+        case StmtKind::IF: {
+            auto* i = static_cast<IfStmt*>(stmt);
+            auto newIf = make_unique<IfStmt>();
+            newIf->cond = substituteVar(i->cond.get(), varName, value);
+            newIf->thenStmt = substituteVarInStmt(i->thenStmt.get(), varName, value);
+            if (i->elseStmt) newIf->elseStmt = substituteVarInStmt(i->elseStmt.get(), varName, value);
+            return newIf;
+        }
+        case StmtKind::WHILE: {
+            auto* w = static_cast<WhileStmt*>(stmt);
+            auto newWhile = make_unique<WhileStmt>();
+            newWhile->cond = substituteVar(w->cond.get(), varName, value);
+            newWhile->body = substituteVarInStmt(w->body.get(), varName, value);
+            return newWhile;
+        }
+        case StmtKind::BREAK:
+            return make_unique<BreakStmt>();
+        case StmtKind::CONTINUE:
+            return make_unique<ContinueStmt>();
+        case StmtKind::RETURN: {
+            auto* r = static_cast<ReturnStmt*>(stmt);
+            if (r->value) return make_unique<ReturnStmt>(substituteVar(r->value.get(), varName, value));
+            return make_unique<ReturnStmt>();
+        }
+        case StmtKind::EXPR: {
+            auto* e = static_cast<ExprStmt*>(stmt);
+            return make_unique<ExprStmt>(substituteVar(e->expr.get(), varName, value));
+        }
+        case StmtKind::EMPTY:
+            return make_unique<EmptyStmt>();
+        }
+        return nullptr;
+    }
+
+    // 循环完全展开
+    bool unrollKnownLoops(vector<unique_ptr<Stmt>>& stmts) {
+        bool changed = false;
+
+        for (size_t i = 0; i < stmts.size(); i++) {
+            // 递归处理嵌套结构
+            if (stmts[i]->kind == StmtKind::BLOCK) {
+                if (unrollKnownLoops(static_cast<BlockStmt*>(stmts[i].get())->stmts))
+                    changed = true;
+            } else if (stmts[i]->kind == StmtKind::IF) {
+                auto* ifStmt = static_cast<IfStmt*>(stmts[i].get());
+                if (ifStmt->thenStmt->kind == StmtKind::BLOCK) {
+                    if (unrollKnownLoops(static_cast<BlockStmt*>(ifStmt->thenStmt.get())->stmts))
+                        changed = true;
+                }
+                if (ifStmt->elseStmt && ifStmt->elseStmt->kind == StmtKind::BLOCK) {
+                    if (unrollKnownLoops(static_cast<BlockStmt*>(ifStmt->elseStmt.get())->stmts))
+                        changed = true;
+                }
+            }
+
+            if (stmts[i]->kind != StmtKind::WHILE) continue;
+            auto* whileStmt = static_cast<WhileStmt*>(stmts[i].get());
+
+            // 检测模式: int i = init; while (i < bound) { ...; i = i + step; }
+            if (i == 0) continue;
+            if (stmts[i-1]->kind != StmtKind::VARDECL) continue;
+
+            auto* initStmt = static_cast<VarDeclStmt*>(stmts[i-1].get());
+            if (initStmt->init->kind != ExprKind::NUMBER) continue;
+
+            string inductionVar = initStmt->name;
+            int initVal = static_cast<NumberExpr*>(initStmt->init.get())->value;
+
+            // 检查条件 i < const 或 i <= const
+            if (whileStmt->cond->kind != ExprKind::BINARY) continue;
+            auto* cond = static_cast<BinaryExpr*>(whileStmt->cond.get());
+            if (cond->op != "<" && cond->op != "<=") continue;
+            if (cond->left->kind != ExprKind::IDENT) continue;
+            if (cond->right->kind != ExprKind::NUMBER) continue;
+            if (static_cast<IdentExpr*>(cond->left.get())->name != inductionVar) continue;
+
+            int bound = static_cast<NumberExpr*>(cond->right.get())->value;
+            if (cond->op == "<=") bound++; // 转换为 <
+
+            // 检测步长
+            if (whileStmt->body->kind != StmtKind::BLOCK) continue;
+            auto* body = static_cast<BlockStmt*>(whileStmt->body.get());
+            if (body->stmts.empty()) continue;
+
+            // 找到最后一条语句，应该是 i = i + step
+            int step = 0;
+            bool foundStep = false;
+            for (auto it = body->stmts.rbegin(); it != body->stmts.rend(); ++it) {
+                if ((*it)->kind == StmtKind::ASSIGN) {
+                    auto* assign = static_cast<AssignStmt*>(it->get());
+                    if (assign->name == inductionVar && assign->value->kind == ExprKind::BINARY) {
+                        auto* binary = static_cast<BinaryExpr*>(assign->value.get());
+                        if ((binary->op == "+" || binary->op == "-") &&
+                            binary->left->kind == ExprKind::IDENT &&
+                            binary->right->kind == ExprKind::NUMBER &&
+                            static_cast<IdentExpr*>(binary->left.get())->name == inductionVar) {
+                            step = static_cast<NumberExpr*>(binary->right.get())->value;
+                            if (binary->op == "-") step = -step;
+                            foundStep = true;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (!foundStep || step == 0) continue;
+
+            int iterations = (bound - initVal) / step;
+            if ((bound - initVal) % step != 0) iterations++;
+
+            // 只展开小循环：次数 <= 16，循环体 <= 8 条语句
+            if (iterations <= 0 || iterations > 16) continue;
+            if (countStmtsInBody(whileStmt->body.get()) > 8) continue;
+
+            // 执行展开
+            vector<unique_ptr<Stmt>> unrolled;
+            for (int iter = 0; iter < iterations; iter++) {
+                int currentVal = initVal + iter * step;
+                // 展开循环体中的每条语句（除了归纳变量更新）
+                for (auto& s : body->stmts) {
+                    if (s->kind == StmtKind::ASSIGN) {
+                        auto* assign = static_cast<AssignStmt*>(s.get());
+                        if (assign->name == inductionVar) continue; // 跳过归纳变量更新
+                    }
+                    auto newStmt = substituteVarInStmt(s.get(), inductionVar, currentVal);
+                    if (newStmt->kind != StmtKind::EMPTY) {
+                        unrolled.push_back(move(newStmt));
+                    }
+                }
+            }
+
+            // 删除初始化语句和while循环，插入展开后的语句
+            stmts.erase(stmts.begin() + i - 1, stmts.begin() + i + 1);
+            for (size_t j = 0; j < unrolled.size(); j++) {
+                stmts.insert(stmts.begin() + i - 1 + j, move(unrolled[j]));
+            }
+
+            changed = true;
+            i = i - 1 + unrolled.size() - 1; // 调整索引
+        }
+
+        return changed;
+    }
+
 public:
     void optimize(Program* prog) {
         // 第一阶段：多轮基础优化
@@ -1734,6 +2003,23 @@ public:
                     constVars.erase(p->name);
                 }
 
+                if (optimizeStmtList(func->body->stmts)) {
+                    changed = true;
+                }
+            }
+            if (!changed) break;
+        }
+
+        // 新增阶段：循环完全展开
+        for (auto& func : prog->functions) {
+            unrollKnownLoops(func->body->stmts);
+        }
+        // 展开后再次运行基础优化
+        for (int round = 0; round < 5; round++) {
+            bool changed = false;
+            for (auto& func : prog->functions) {
+                constVars.clear();
+                copyVars.clear();
                 if (optimizeStmtList(func->body->stmts)) {
                     changed = true;
                 }
