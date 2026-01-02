@@ -1050,70 +1050,70 @@ private:
 
     // 尾递归优化
     void optimizeTailRecursion(FuncDef* func) {
+        if (!func || !func->body) return;
         if (func->isVoid) return;  // void 函数不处理
 
         currentFunc = func->name;
         currentParams.clear();
         for (auto& p : func->params) {
-            currentParams.push_back(p->name);
+            if (p) currentParams.push_back(p->name);
         }
+
+        if (currentParams.empty()) return;  // 无参数函数不优化
 
         auto& stmts = func->body->stmts;
+        if (stmts.empty()) return;
 
-        // 查找尾递归 return
-        for (size_t i = 0; i < stmts.size(); i++) {
-            if (isTailRecursiveReturn(stmts[i].get())) {
-                // 转换为循环
-                auto* ret = static_cast<ReturnStmt*>(stmts[i].get());
-                auto* call = static_cast<CallExpr*>(ret->value.get());
+        // 查找尾递归 return（只查找最后一条语句）
+        size_t lastIdx = stmts.size() - 1;
+        if (!isTailRecursiveReturn(stmts[lastIdx].get())) return;
 
-                // 创建循环体
-                auto loopBody = make_unique<BlockStmt>();
+        // 转换为循环
+        auto* ret = static_cast<ReturnStmt*>(stmts[lastIdx].get());
+        if (!ret->value) return;
+        auto* call = static_cast<CallExpr*>(ret->value.get());
+        if (!call) return;
 
-                // 创建参数更新语句
-                vector<unique_ptr<Expr>> newArgs;
-                for (auto& arg : call->args) {
-                    newArgs.push_back(cloneExpr(arg.get()));
-                }
+        // 参数数量必须匹配
+        if (call->args.size() != currentParams.size()) return;
 
-                // 使用临时变量避免覆盖
-                for (size_t j = 0; j < currentParams.size() && j < newArgs.size(); j++) {
-                    string tmpName = "__tmp_" + to_string(j);
-                    loopBody->stmts.push_back(make_unique<VarDeclStmt>(tmpName, move(newArgs[j])));
-                }
-                for (size_t j = 0; j < currentParams.size() && j < call->args.size(); j++) {
-                    string tmpName = "__tmp_" + to_string(j);
-                    loopBody->stmts.push_back(make_unique<AssignStmt>(currentParams[j],
-                        make_unique<IdentExpr>(tmpName)));
-                }
+        // 创建循环体
+        auto loopBody = make_unique<BlockStmt>();
 
-                // 创建 while(1) 循环
-                auto whileStmt = make_unique<WhileStmt>();
-                whileStmt->cond = make_unique<NumberExpr>(1);
+        // 克隆参数表达式到临时变量
+        for (size_t j = 0; j < currentParams.size(); j++) {
+            string tmpName = "__tail_tmp_" + to_string(j);
+            auto cloned = cloneExpr(call->args[j].get());
+            if (!cloned) return;  // 克隆失败，放弃优化
+            loopBody->stmts.push_back(make_unique<VarDeclStmt>(tmpName, move(cloned)));
+        }
 
-                // 将原来的语句移到循环体开头（除了尾递归 return）
-                auto outerBody = make_unique<BlockStmt>();
-                for (size_t j = 0; j < i; j++) {
-                    outerBody->stmts.push_back(move(stmts[j]));
-                }
-                // 添加 continue
-                loopBody->stmts.push_back(make_unique<ContinueStmt>());
+        // 将临时变量赋值给参数
+        for (size_t j = 0; j < currentParams.size(); j++) {
+            string tmpName = "__tail_tmp_" + to_string(j);
+            loopBody->stmts.push_back(make_unique<AssignStmt>(currentParams[j],
+                make_unique<IdentExpr>(tmpName)));
+        }
 
-                // 组合循环体：反向遍历以保持原始顺序
-                for (auto it = outerBody->stmts.rbegin(); it != outerBody->stmts.rend(); ++it) {
-                    static_cast<BlockStmt*>(loopBody.get())->stmts.insert(
-                        static_cast<BlockStmt*>(loopBody.get())->stmts.begin(),
-                        move(*it));
-                }
+        // 添加 continue
+        loopBody->stmts.push_back(make_unique<ContinueStmt>());
 
-                whileStmt->body = move(loopBody);
+        // 创建 while(1) 循环
+        auto whileStmt = make_unique<WhileStmt>();
+        whileStmt->cond = make_unique<NumberExpr>(1);
 
-                // 重构函数体
-                stmts.clear();
-                stmts.push_back(move(whileStmt));
-                break;
+        // 将原来的语句（除了最后的尾递归return）插入到循环体开头
+        for (size_t j = 0; j < lastIdx; j++) {
+            if (stmts[j]) {
+                loopBody->stmts.insert(loopBody->stmts.begin() + j, move(stmts[j]));
             }
         }
+
+        whileStmt->body = move(loopBody);
+
+        // 重构函数体
+        stmts.clear();
+        stmts.push_back(move(whileStmt));
     }
 
     // 收集循环内被修改的变量
@@ -2798,10 +2798,10 @@ public:
             cseStmtList(func->body->stmts);
         }
 
-        // 第五阶段：尾递归优化（暂时禁用以调试段错误）
-        // for (auto& func : prog->functions) {
-        //     optimizeTailRecursion(func.get());
-        // }
+        // 第五阶段：尾递归优化
+        for (auto& func : prog->functions) {
+            optimizeTailRecursion(func.get());
+        }
 
         // 第六阶段：死变量消除
         for (int round = 0; round < 3; round++) {
