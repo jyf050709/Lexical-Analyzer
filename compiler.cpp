@@ -3174,48 +3174,42 @@ private:
             }
 
             // 普通二元运算 - 使用多寄存器分配器优化
-            if (g_optimize && !needSpill()) {
-                // 有足够寄存器，不需要压栈
-                string leftReg = allocReg();
-                genExprToReg(binary->left.get(), leftReg);
+            // 只有当两个操作数都是简单表达式时才使用多寄存器
+            bool leftSimple = (binary->left->kind == ExprKind::NUMBER || binary->left->kind == ExprKind::IDENT);
+            bool rightSimple = (binary->right->kind == ExprKind::NUMBER || binary->right->kind == ExprKind::IDENT);
 
-                if (!needSpill()) {
-                    string rightReg = allocReg();
-                    genExprToReg(binary->right.get(), rightReg);
+            if (g_optimize && leftSimple && rightSimple) {
+                // 两个操作数都是简单表达式，直接使用不同寄存器
+                genExprToReg(binary->left.get(), "t1");
+                genExprToReg(binary->right.get(), "t2");
 
-                    // 使用两个寄存器进行运算，结果放回t0
-                    if (binary->op == "+") emit("add t0, " + leftReg + ", " + rightReg);
-                    else if (binary->op == "-") emit("sub t0, " + leftReg + ", " + rightReg);
-                    else if (binary->op == "*") emit("mul t0, " + leftReg + ", " + rightReg);
-                    else if (binary->op == "/") emit("div t0, " + leftReg + ", " + rightReg);
-                    else if (binary->op == "%") emit("rem t0, " + leftReg + ", " + rightReg);
-                    else if (binary->op == "<") emit("slt t0, " + leftReg + ", " + rightReg);
-                    else if (binary->op == ">") emit("slt t0, " + rightReg + ", " + leftReg);
-                    else if (binary->op == "<=") {
-                        emit("slt t0, " + rightReg + ", " + leftReg);
-                        emit("xori t0, t0, 1");
-                    }
-                    else if (binary->op == ">=") {
-                        emit("slt t0, " + leftReg + ", " + rightReg);
-                        emit("xori t0, t0, 1");
-                    }
-                    else if (binary->op == "==") {
-                        emit("sub t0, " + leftReg + ", " + rightReg);
-                        emit("seqz t0, t0");
-                    }
-                    else if (binary->op == "!=") {
-                        emit("sub t0, " + leftReg + ", " + rightReg);
-                        emit("snez t0, t0");
-                    }
-
-                    freeReg(); // 释放rightReg
-                    freeReg(); // 释放leftReg
-                    break;
+                if (binary->op == "+") emit("add t0, t1, t2");
+                else if (binary->op == "-") emit("sub t0, t1, t2");
+                else if (binary->op == "*") emit("mul t0, t1, t2");
+                else if (binary->op == "/") emit("div t0, t1, t2");
+                else if (binary->op == "%") emit("rem t0, t1, t2");
+                else if (binary->op == "<") emit("slt t0, t1, t2");
+                else if (binary->op == ">") emit("slt t0, t2, t1");
+                else if (binary->op == "<=") {
+                    emit("slt t0, t2, t1");
+                    emit("xori t0, t0, 1");
                 }
-                freeReg(); // 回退leftReg分配
+                else if (binary->op == ">=") {
+                    emit("slt t0, t1, t2");
+                    emit("xori t0, t0, 1");
+                }
+                else if (binary->op == "==") {
+                    emit("sub t0, t1, t2");
+                    emit("seqz t0, t0");
+                }
+                else if (binary->op == "!=") {
+                    emit("sub t0, t1, t2");
+                    emit("snez t0, t0");
+                }
+                break;
             }
 
-            // 回退到栈保存方式（寄存器不足时）
+            // 回退到栈保存方式（复杂表达式时）
             genExpr(binary->left.get());
             emit("addi sp, sp, -4");
             emit("sw t0, 0(sp)");
