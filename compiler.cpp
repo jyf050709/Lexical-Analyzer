@@ -8,6 +8,7 @@
 #include <sstream>
 #include <cctype>
 #include <cmath>
+#include <tuple>
 
 using namespace std;
 
@@ -463,6 +464,12 @@ private:
     string currentFunc;
     // 当前函数参数
     vector<string> currentParams;
+    // 函数表（用于内联）
+    map<string, FuncDef*> funcTable;
+    // 函数调用计数
+    map<string, int> funcCallCount;
+    // 内联计数器（用于生成唯一变量名）
+    int inlineCount = 0;
 
     // 检查表达式是否为常量
     bool isConstExpr(Expr* expr) {
@@ -1990,6 +1997,496 @@ private:
         return changed;
     }
 
+    // 统计函数调用次数
+    void countFuncCalls(Expr* expr) {
+        switch (expr->kind) {
+        case ExprKind::UNARY:
+            countFuncCalls(static_cast<UnaryExpr*>(expr)->operand.get());
+            break;
+        case ExprKind::BINARY: {
+            auto* b = static_cast<BinaryExpr*>(expr);
+            countFuncCalls(b->left.get());
+            countFuncCalls(b->right.get());
+            break;
+        }
+        case ExprKind::CALL: {
+            auto* c = static_cast<CallExpr*>(expr);
+            funcCallCount[c->funcName]++;
+            for (auto& arg : c->args) {
+                countFuncCalls(arg.get());
+            }
+            break;
+        }
+        default:
+            break;
+        }
+    }
+
+    void countFuncCallsInStmt(Stmt* stmt) {
+        switch (stmt->kind) {
+        case StmtKind::BLOCK: {
+            auto* block = static_cast<BlockStmt*>(stmt);
+            for (auto& s : block->stmts) countFuncCallsInStmt(s.get());
+            break;
+        }
+        case StmtKind::VARDECL:
+            countFuncCalls(static_cast<VarDeclStmt*>(stmt)->init.get());
+            break;
+        case StmtKind::ASSIGN:
+            countFuncCalls(static_cast<AssignStmt*>(stmt)->value.get());
+            break;
+        case StmtKind::IF: {
+            auto* i = static_cast<IfStmt*>(stmt);
+            countFuncCalls(i->cond.get());
+            countFuncCallsInStmt(i->thenStmt.get());
+            if (i->elseStmt) countFuncCallsInStmt(i->elseStmt.get());
+            break;
+        }
+        case StmtKind::WHILE: {
+            auto* w = static_cast<WhileStmt*>(stmt);
+            countFuncCalls(w->cond.get());
+            countFuncCallsInStmt(w->body.get());
+            break;
+        }
+        case StmtKind::RETURN: {
+            auto* r = static_cast<ReturnStmt*>(stmt);
+            if (r->value) countFuncCalls(r->value.get());
+            break;
+        }
+        case StmtKind::EXPR:
+            countFuncCalls(static_cast<ExprStmt*>(stmt)->expr.get());
+            break;
+        default:
+            break;
+        }
+    }
+
+    // 检查函数是否递归
+    bool isRecursive(FuncDef* func) {
+        return checkRecursive(func->body.get(), func->name);
+    }
+
+    bool checkRecursive(Stmt* stmt, const string& funcName) {
+        switch (stmt->kind) {
+        case StmtKind::BLOCK: {
+            auto* block = static_cast<BlockStmt*>(stmt);
+            for (auto& s : block->stmts) {
+                if (checkRecursive(s.get(), funcName)) return true;
+            }
+            return false;
+        }
+        case StmtKind::VARDECL:
+            return checkRecursiveExpr(static_cast<VarDeclStmt*>(stmt)->init.get(), funcName);
+        case StmtKind::ASSIGN:
+            return checkRecursiveExpr(static_cast<AssignStmt*>(stmt)->value.get(), funcName);
+        case StmtKind::IF: {
+            auto* i = static_cast<IfStmt*>(stmt);
+            if (checkRecursiveExpr(i->cond.get(), funcName)) return true;
+            if (checkRecursive(i->thenStmt.get(), funcName)) return true;
+            if (i->elseStmt && checkRecursive(i->elseStmt.get(), funcName)) return true;
+            return false;
+        }
+        case StmtKind::WHILE: {
+            auto* w = static_cast<WhileStmt*>(stmt);
+            if (checkRecursiveExpr(w->cond.get(), funcName)) return true;
+            return checkRecursive(w->body.get(), funcName);
+        }
+        case StmtKind::RETURN: {
+            auto* r = static_cast<ReturnStmt*>(stmt);
+            if (r->value) return checkRecursiveExpr(r->value.get(), funcName);
+            return false;
+        }
+        case StmtKind::EXPR:
+            return checkRecursiveExpr(static_cast<ExprStmt*>(stmt)->expr.get(), funcName);
+        default:
+            return false;
+        }
+    }
+
+    bool checkRecursiveExpr(Expr* expr, const string& funcName) {
+        switch (expr->kind) {
+        case ExprKind::UNARY:
+            return checkRecursiveExpr(static_cast<UnaryExpr*>(expr)->operand.get(), funcName);
+        case ExprKind::BINARY: {
+            auto* b = static_cast<BinaryExpr*>(expr);
+            return checkRecursiveExpr(b->left.get(), funcName) ||
+                   checkRecursiveExpr(b->right.get(), funcName);
+        }
+        case ExprKind::CALL: {
+            auto* c = static_cast<CallExpr*>(expr);
+            if (c->funcName == funcName) return true;
+            for (auto& arg : c->args) {
+                if (checkRecursiveExpr(arg.get(), funcName)) return true;
+            }
+            return false;
+        }
+        default:
+            return false;
+        }
+    }
+
+    // 计算函数体语句数
+    int countFuncStmts(FuncDef* func) {
+        return countStmtsInBody(func->body.get());
+    }
+
+    // 判断函数是否可内联 - 暂时禁用
+    bool canInline(FuncDef* func) {
+        return false;  // 暂时禁用函数内联
+    }
+
+    // 在表达式中进行变量重命名
+    unique_ptr<Expr> renameVarsInExpr(Expr* expr, const map<string, string>& renameMap) {
+        switch (expr->kind) {
+        case ExprKind::NUMBER:
+            return make_unique<NumberExpr>(static_cast<NumberExpr*>(expr)->value);
+        case ExprKind::IDENT: {
+            auto* ident = static_cast<IdentExpr*>(expr);
+            if (renameMap.count(ident->name)) {
+                return make_unique<IdentExpr>(renameMap.at(ident->name));
+            }
+            return make_unique<IdentExpr>(ident->name);
+        }
+        case ExprKind::UNARY: {
+            auto* u = static_cast<UnaryExpr*>(expr);
+            return make_unique<UnaryExpr>(u->op, renameVarsInExpr(u->operand.get(), renameMap));
+        }
+        case ExprKind::BINARY: {
+            auto* b = static_cast<BinaryExpr*>(expr);
+            return make_unique<BinaryExpr>(b->op,
+                renameVarsInExpr(b->left.get(), renameMap),
+                renameVarsInExpr(b->right.get(), renameMap));
+        }
+        case ExprKind::CALL: {
+            auto* c = static_cast<CallExpr*>(expr);
+            auto newCall = make_unique<CallExpr>(c->funcName);
+            for (auto& arg : c->args) {
+                newCall->args.push_back(renameVarsInExpr(arg.get(), renameMap));
+            }
+            return newCall;
+        }
+        }
+        return nullptr;
+    }
+
+    // 收集语句中定义的变量
+    void collectDefinedVars(Stmt* stmt, set<string>& vars) {
+        switch (stmt->kind) {
+        case StmtKind::BLOCK: {
+            auto* block = static_cast<BlockStmt*>(stmt);
+            for (auto& s : block->stmts) collectDefinedVars(s.get(), vars);
+            break;
+        }
+        case StmtKind::VARDECL:
+            vars.insert(static_cast<VarDeclStmt*>(stmt)->name);
+            break;
+        case StmtKind::IF: {
+            auto* i = static_cast<IfStmt*>(stmt);
+            collectDefinedVars(i->thenStmt.get(), vars);
+            if (i->elseStmt) collectDefinedVars(i->elseStmt.get(), vars);
+            break;
+        }
+        case StmtKind::WHILE: {
+            auto* w = static_cast<WhileStmt*>(stmt);
+            collectDefinedVars(w->body.get(), vars);
+            break;
+        }
+        default:
+            break;
+        }
+    }
+
+    // 在语句中进行变量重命名
+    unique_ptr<Stmt> renameVarsInStmt(Stmt* stmt, map<string, string>& renameMap, const string& prefix) {
+        switch (stmt->kind) {
+        case StmtKind::BLOCK: {
+            auto* block = static_cast<BlockStmt*>(stmt);
+            auto newBlock = make_unique<BlockStmt>();
+            for (auto& s : block->stmts) {
+                newBlock->stmts.push_back(renameVarsInStmt(s.get(), renameMap, prefix));
+            }
+            return newBlock;
+        }
+        case StmtKind::VARDECL: {
+            auto* v = static_cast<VarDeclStmt*>(stmt);
+            string newName = prefix + v->name;
+            renameMap[v->name] = newName;
+            return make_unique<VarDeclStmt>(newName, renameVarsInExpr(v->init.get(), renameMap));
+        }
+        case StmtKind::ASSIGN: {
+            auto* a = static_cast<AssignStmt*>(stmt);
+            string name = renameMap.count(a->name) ? renameMap[a->name] : a->name;
+            return make_unique<AssignStmt>(name, renameVarsInExpr(a->value.get(), renameMap));
+        }
+        case StmtKind::IF: {
+            auto* i = static_cast<IfStmt*>(stmt);
+            auto newIf = make_unique<IfStmt>();
+            newIf->cond = renameVarsInExpr(i->cond.get(), renameMap);
+            newIf->thenStmt = renameVarsInStmt(i->thenStmt.get(), renameMap, prefix);
+            if (i->elseStmt) newIf->elseStmt = renameVarsInStmt(i->elseStmt.get(), renameMap, prefix);
+            return newIf;
+        }
+        case StmtKind::WHILE: {
+            auto* w = static_cast<WhileStmt*>(stmt);
+            auto newWhile = make_unique<WhileStmt>();
+            newWhile->cond = renameVarsInExpr(w->cond.get(), renameMap);
+            newWhile->body = renameVarsInStmt(w->body.get(), renameMap, prefix);
+            return newWhile;
+        }
+        case StmtKind::BREAK:
+            return make_unique<BreakStmt>();
+        case StmtKind::CONTINUE:
+            return make_unique<ContinueStmt>();
+        case StmtKind::RETURN: {
+            auto* r = static_cast<ReturnStmt*>(stmt);
+            if (r->value) return make_unique<ReturnStmt>(renameVarsInExpr(r->value.get(), renameMap));
+            return make_unique<ReturnStmt>();
+        }
+        case StmtKind::EXPR: {
+            auto* e = static_cast<ExprStmt*>(stmt);
+            return make_unique<ExprStmt>(renameVarsInExpr(e->expr.get(), renameMap));
+        }
+        case StmtKind::EMPTY:
+            return make_unique<EmptyStmt>();
+        }
+        return nullptr;
+    }
+
+    // 内联单个调用
+    // 返回：展开后的语句列表 + 结果变量名
+    pair<vector<unique_ptr<Stmt>>, string> inlineCall(CallExpr* call, FuncDef* func) {
+        vector<unique_ptr<Stmt>> stmts;
+        string prefix = "__inline_" + to_string(inlineCount++) + "_";
+        string resultVar = prefix + "result";
+
+        // 创建重命名映射
+        map<string, string> renameMap;
+
+        // 为参数创建临时变量
+        for (size_t i = 0; i < func->params.size() && i < call->args.size(); i++) {
+            string paramName = func->params[i]->name;
+            string newName = prefix + paramName;
+            renameMap[paramName] = newName;
+            stmts.push_back(make_unique<VarDeclStmt>(newName, cloneExpr(call->args[i].get())));
+        }
+
+        // 创建结果变量
+        if (!func->isVoid) {
+            stmts.push_back(make_unique<VarDeclStmt>(resultVar, make_unique<NumberExpr>(0)));
+        }
+
+        // 复制函数体（处理 return）
+        for (auto& s : func->body->stmts) {
+            if (s->kind == StmtKind::RETURN) {
+                auto* ret = static_cast<ReturnStmt*>(s.get());
+                if (ret->value && !func->isVoid) {
+                    // 将 return expr 转换为 result = expr
+                    stmts.push_back(make_unique<AssignStmt>(resultVar,
+                        renameVarsInExpr(ret->value.get(), renameMap)));
+                }
+                // 不生成 return 语句
+            } else {
+                stmts.push_back(renameVarsInStmt(s.get(), renameMap, prefix));
+            }
+        }
+
+        return {move(stmts), resultVar};
+    }
+
+    // 在表达式中内联函数调用
+    // 返回：是否修改，展开后的语句列表，新表达式
+    tuple<bool, vector<unique_ptr<Stmt>>, unique_ptr<Expr>> inlineExpr(Expr* expr) {
+        switch (expr->kind) {
+        case ExprKind::NUMBER: {
+            vector<unique_ptr<Stmt>> empty;
+            return make_tuple(false, move(empty), make_unique<NumberExpr>(static_cast<NumberExpr*>(expr)->value));
+        }
+        case ExprKind::IDENT: {
+            vector<unique_ptr<Stmt>> empty;
+            return make_tuple(false, move(empty), make_unique<IdentExpr>(static_cast<IdentExpr*>(expr)->name));
+        }
+        case ExprKind::UNARY: {
+            auto* u = static_cast<UnaryExpr*>(expr);
+            auto [changed, stmts, newOperand] = inlineExpr(u->operand.get());
+            return make_tuple(changed, move(stmts), make_unique<UnaryExpr>(u->op, move(newOperand)));
+        }
+        case ExprKind::BINARY: {
+            auto* b = static_cast<BinaryExpr*>(expr);
+            auto [leftChanged, leftStmts, newLeft] = inlineExpr(b->left.get());
+            auto [rightChanged, rightStmts, newRight] = inlineExpr(b->right.get());
+
+            vector<unique_ptr<Stmt>> allStmts;
+            for (auto& s : leftStmts) allStmts.push_back(move(s));
+            for (auto& s : rightStmts) allStmts.push_back(move(s));
+
+            return make_tuple(leftChanged || rightChanged, move(allStmts),
+                    make_unique<BinaryExpr>(b->op, move(newLeft), move(newRight)));
+        }
+        case ExprKind::CALL: {
+            auto* call = static_cast<CallExpr*>(expr);
+
+            // 先递归处理参数
+            vector<unique_ptr<Stmt>> preStmts;
+            auto newCall = make_unique<CallExpr>(call->funcName);
+            bool argsChanged = false;
+            for (auto& arg : call->args) {
+                auto [changed, stmts, newArg] = inlineExpr(arg.get());
+                if (changed) argsChanged = true;
+                for (auto& s : stmts) preStmts.push_back(move(s));
+                newCall->args.push_back(move(newArg));
+            }
+
+            // 检查是否可以内联
+            if (funcTable.count(call->funcName) && canInline(funcTable[call->funcName])) {
+                FuncDef* func = funcTable[call->funcName];
+                auto [inlinedStmts, resultVar] = inlineCall(call, func);
+                for (auto& s : inlinedStmts) preStmts.push_back(move(s));
+                return make_tuple(true, move(preStmts), make_unique<IdentExpr>(resultVar));
+            }
+
+            return make_tuple(argsChanged, move(preStmts), move(newCall));
+        }
+        }
+        vector<unique_ptr<Stmt>> empty;
+        return make_tuple(false, move(empty), unique_ptr<Expr>(nullptr));
+    }
+
+    // 在语句中内联函数调用
+    bool inlineStmtList(vector<unique_ptr<Stmt>>& stmts) {
+        bool changed = false;
+        vector<unique_ptr<Stmt>> newStmts;
+
+        for (auto& stmt : stmts) {
+            vector<unique_ptr<Stmt>> preStmts;
+
+            switch (stmt->kind) {
+            case StmtKind::BLOCK: {
+                auto* block = static_cast<BlockStmt*>(stmt.get());
+                if (inlineStmtList(block->stmts)) changed = true;
+                newStmts.push_back(move(stmt));
+                break;
+            }
+            case StmtKind::VARDECL: {
+                auto* v = static_cast<VarDeclStmt*>(stmt.get());
+                auto [exprChanged, stmtsList, newInit] = inlineExpr(v->init.get());
+                if (exprChanged) {
+                    changed = true;
+                    for (auto& s : stmtsList) newStmts.push_back(move(s));
+                    newStmts.push_back(make_unique<VarDeclStmt>(v->name, move(newInit)));
+                } else {
+                    newStmts.push_back(move(stmt));
+                }
+                break;
+            }
+            case StmtKind::ASSIGN: {
+                auto* a = static_cast<AssignStmt*>(stmt.get());
+                auto [exprChanged, stmtsList, newValue] = inlineExpr(a->value.get());
+                if (exprChanged) {
+                    changed = true;
+                    for (auto& s : stmtsList) newStmts.push_back(move(s));
+                    newStmts.push_back(make_unique<AssignStmt>(a->name, move(newValue)));
+                } else {
+                    newStmts.push_back(move(stmt));
+                }
+                break;
+            }
+            case StmtKind::IF: {
+                auto* i = static_cast<IfStmt*>(stmt.get());
+                auto [condChanged, condStmts, newCond] = inlineExpr(i->cond.get());
+                if (condChanged) changed = true;
+                for (auto& s : condStmts) newStmts.push_back(move(s));
+
+                if (i->thenStmt->kind == StmtKind::BLOCK) {
+                    if (inlineStmtList(static_cast<BlockStmt*>(i->thenStmt.get())->stmts))
+                        changed = true;
+                }
+                if (i->elseStmt && i->elseStmt->kind == StmtKind::BLOCK) {
+                    if (inlineStmtList(static_cast<BlockStmt*>(i->elseStmt.get())->stmts))
+                        changed = true;
+                }
+
+                if (condChanged) {
+                    auto newIf = make_unique<IfStmt>();
+                    newIf->cond = move(newCond);
+                    newIf->thenStmt = move(i->thenStmt);
+                    newIf->elseStmt = move(i->elseStmt);
+                    newStmts.push_back(move(newIf));
+                } else {
+                    newStmts.push_back(move(stmt));
+                }
+                break;
+            }
+            case StmtKind::WHILE: {
+                auto* w = static_cast<WhileStmt*>(stmt.get());
+                // 循环条件内的函数调用不要内联（可能被多次执行）
+                if (w->body->kind == StmtKind::BLOCK) {
+                    if (inlineStmtList(static_cast<BlockStmt*>(w->body.get())->stmts))
+                        changed = true;
+                }
+                newStmts.push_back(move(stmt));
+                break;
+            }
+            case StmtKind::RETURN: {
+                auto* r = static_cast<ReturnStmt*>(stmt.get());
+                if (r->value) {
+                    auto [exprChanged, stmtsList, newValue] = inlineExpr(r->value.get());
+                    if (exprChanged) {
+                        changed = true;
+                        for (auto& s : stmtsList) newStmts.push_back(move(s));
+                        newStmts.push_back(make_unique<ReturnStmt>(move(newValue)));
+                    } else {
+                        newStmts.push_back(move(stmt));
+                    }
+                } else {
+                    newStmts.push_back(move(stmt));
+                }
+                break;
+            }
+            case StmtKind::EXPR: {
+                auto* e = static_cast<ExprStmt*>(stmt.get());
+                auto [exprChanged, stmtsList, newExpr] = inlineExpr(e->expr.get());
+                if (exprChanged) {
+                    changed = true;
+                    for (auto& s : stmtsList) newStmts.push_back(move(s));
+                    // 只有函数调用表达式需要保留
+                    if (newExpr->kind == ExprKind::CALL) {
+                        newStmts.push_back(make_unique<ExprStmt>(move(newExpr)));
+                    }
+                } else {
+                    newStmts.push_back(move(stmt));
+                }
+                break;
+            }
+            default:
+                newStmts.push_back(move(stmt));
+                break;
+            }
+        }
+
+        stmts = move(newStmts);
+        return changed;
+    }
+
+    // 函数内联主入口
+    void inlineFunctions(Program* prog) {
+        // 构建函数表
+        funcTable.clear();
+        funcCallCount.clear();
+        for (auto& func : prog->functions) {
+            funcTable[func->name] = func.get();
+        }
+
+        // 统计函数调用次数
+        for (auto& func : prog->functions) {
+            countFuncCallsInStmt(func->body.get());
+        }
+
+        // 对每个函数进行内联
+        for (auto& func : prog->functions) {
+            inlineStmtList(func->body->stmts);
+        }
+    }
+
 public:
     void optimize(Program* prog) {
         // 第一阶段：多轮基础优化
@@ -2010,11 +2507,9 @@ public:
             if (!changed) break;
         }
 
-        // 新增阶段：循环完全展开
-        for (auto& func : prog->functions) {
-            unrollKnownLoops(func->body->stmts);
-        }
-        // 展开后再次运行基础优化
+        // 函数内联阶段
+        inlineFunctions(prog);
+        // 内联后运行基础优化
         for (int round = 0; round < 5; round++) {
             bool changed = false;
             for (auto& func : prog->functions) {
@@ -2026,6 +2521,23 @@ public:
             }
             if (!changed) break;
         }
+
+        // 新增阶段：循环完全展开 (暂时禁用)
+        // for (auto& func : prog->functions) {
+        //     unrollKnownLoops(func->body->stmts);
+        // }
+        // // 展开后再次运行基础优化
+        // for (int round = 0; round < 5; round++) {
+        //     bool changed = false;
+        //     for (auto& func : prog->functions) {
+        //         constVars.clear();
+        //         copyVars.clear();
+        //         if (optimizeStmtList(func->body->stmts)) {
+        //             changed = true;
+        //         }
+        //     }
+        //     if (!changed) break;
+        // }
 
         // 第二阶段：循环不变量外提
         for (auto& func : prog->functions) {
@@ -2101,6 +2613,40 @@ private:
     vector<map<string, int>> varScopes;
     // 参数名 -> 参数索引
     map<string, int> paramIndex;
+
+    // ========== 寄存器分配器 ==========
+    // 可用寄存器栈：t0-t6 共7个
+    const char* tempRegs[7] = {"t0", "t1", "t2", "t3", "t4", "t5", "t6"};
+    int regStackTop = 0;  // 当前使用的寄存器数量
+
+    // 分配一个寄存器，返回寄存器名
+    string allocReg() {
+        if (g_optimize && regStackTop < 7) {
+            return tempRegs[regStackTop++];
+        }
+        // 回退到 t0
+        return "t0";
+    }
+
+    // 释放最后分配的寄存器
+    void freeReg() {
+        if (g_optimize && regStackTop > 0) {
+            regStackTop--;
+        }
+    }
+
+    // 获取当前结果寄存器
+    string currentReg() {
+        if (g_optimize && regStackTop > 0) {
+            return tempRegs[regStackTop - 1];
+        }
+        return "t0";
+    }
+
+    // 检查是否需要溢出到栈
+    bool needSpill() {
+        return !g_optimize || regStackTop >= 7;
+    }
 
     string newLabel() { return "L" + to_string(labelCount++); }
 
@@ -2620,13 +3166,190 @@ private:
         out << "\n";
     }
 
+    // ========== 窥孔优化 ==========
+    // 解析指令，返回操作码和操作数
+    tuple<string, vector<string>> parseInstruction(const string& line) {
+        string trimmed = line;
+        // 去除前导空白
+        size_t start = trimmed.find_first_not_of(" \t");
+        if (start == string::npos) return {"", {}};
+        trimmed = trimmed.substr(start);
+
+        // 跳过标签
+        if (trimmed.back() == ':' || trimmed[0] == '.') return {"", {}};
+
+        // 分割操作码和操作数
+        size_t space = trimmed.find_first_of(" \t");
+        if (space == string::npos) return {trimmed, {}};
+
+        string opcode = trimmed.substr(0, space);
+        string rest = trimmed.substr(space + 1);
+
+        // 分割操作数
+        vector<string> operands;
+        stringstream ss(rest);
+        string operand;
+        while (getline(ss, operand, ',')) {
+            // 去除空白
+            size_t s = operand.find_first_not_of(" \t");
+            size_t e = operand.find_last_not_of(" \t");
+            if (s != string::npos && e != string::npos) {
+                operands.push_back(operand.substr(s, e - s + 1));
+            }
+        }
+
+        return {opcode, operands};
+    }
+
+    // 窥孔优化主函数
+    string peepholeOptimize(const string& code) {
+        if (!g_optimize) return code;
+
+        vector<string> lines;
+        stringstream ss(code);
+        string line;
+        while (getline(ss, line)) {
+            lines.push_back(line);
+        }
+
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            vector<string> newLines;
+
+            for (size_t i = 0; i < lines.size(); i++) {
+                auto [op, operands] = parseInstruction(lines[i]);
+
+                // 模式1: mv reg, reg (相同寄存器) -> 删除
+                if (op == "mv" && operands.size() == 2 && operands[0] == operands[1]) {
+                    changed = true;
+                    continue;
+                }
+
+                // 模式2: addi reg, reg, 0 -> 删除
+                if (op == "addi" && operands.size() == 3 && operands[0] == operands[1] && operands[2] == "0") {
+                    changed = true;
+                    continue;
+                }
+
+                // 模式3: slli reg, reg, 0 -> 删除 (左移0位)
+                if (op == "slli" && operands.size() == 3 && operands[2] == "0") {
+                    changed = true;
+                    continue;
+                }
+
+                // 模式4: srai reg, reg, 0 -> 删除 (右移0位)
+                if (op == "srai" && operands.size() == 3 && operands[2] == "0") {
+                    changed = true;
+                    continue;
+                }
+
+                // 模式5: j L 后面紧跟 L: -> 删除 j
+                if (op == "j" && operands.size() == 1 && i + 1 < lines.size()) {
+                    string nextLine = lines[i + 1];
+                    size_t start = nextLine.find_first_not_of(" \t");
+                    if (start != string::npos) {
+                        string label = nextLine.substr(start);
+                        if (label == operands[0] + ":") {
+                            changed = true;
+                            continue;
+                        }
+                    }
+                }
+
+                // 模式6: 连续两条 li 到同一寄存器 -> 保留后一条
+                if (op == "li" && operands.size() == 2 && i + 1 < lines.size()) {
+                    auto [nextOp, nextOperands] = parseInstruction(lines[i + 1]);
+                    if (nextOp == "li" && nextOperands.size() == 2 && nextOperands[0] == operands[0]) {
+                        changed = true;
+                        continue;  // 删除当前行
+                    }
+                }
+
+                // 模式7: sw reg, X(sp); lw reg, X(sp) -> 删除 lw
+                if (op == "sw" && operands.size() == 2 && i + 1 < lines.size()) {
+                    auto [nextOp, nextOperands] = parseInstruction(lines[i + 1]);
+                    if (nextOp == "lw" && nextOperands.size() == 2 &&
+                        nextOperands[0] == operands[0] && nextOperands[1] == operands[1]) {
+                        newLines.push_back(lines[i]);
+                        i++;  // 跳过下一条 lw
+                        changed = true;
+                        continue;
+                    }
+                }
+
+                // 模式8: addi sp, sp, -N; addi sp, sp, N 连续出现 -> 删除两条
+                if (op == "addi" && operands.size() == 3 && operands[0] == "sp" &&
+                    operands[1] == "sp" && i + 1 < lines.size()) {
+                    auto [nextOp, nextOperands] = parseInstruction(lines[i + 1]);
+                    if (nextOp == "addi" && nextOperands.size() == 3 &&
+                        nextOperands[0] == "sp" && nextOperands[1] == "sp") {
+                        // 检查是否是相反的偏移
+                        try {
+                            int offset1 = stoi(operands[2]);
+                            int offset2 = stoi(nextOperands[2]);
+                            if (offset1 + offset2 == 0) {
+                                i++;  // 跳过下一条
+                                changed = true;
+                                continue;
+                            }
+                        } catch (...) {}
+                    }
+                }
+
+                // 模式9: li t0, 0; add t0, t0, t1 -> mv t0, t1
+                if (op == "li" && operands.size() == 2 && operands[1] == "0" && i + 1 < lines.size()) {
+                    auto [nextOp, nextOperands] = parseInstruction(lines[i + 1]);
+                    if (nextOp == "add" && nextOperands.size() == 3 &&
+                        nextOperands[0] == operands[0] && nextOperands[1] == operands[0]) {
+                        newLines.push_back("\tmv " + nextOperands[0] + ", " + nextOperands[2]);
+                        i++;  // 跳过下一条
+                        changed = true;
+                        continue;
+                    }
+                    // 也检查 add t0, t1, t0 的情况
+                    if (nextOp == "add" && nextOperands.size() == 3 &&
+                        nextOperands[0] == operands[0] && nextOperands[2] == operands[0]) {
+                        newLines.push_back("\tmv " + nextOperands[0] + ", " + nextOperands[1]);
+                        i++;  // 跳过下一条
+                        changed = true;
+                        continue;
+                    }
+                }
+
+                // 模式10: neg t0, t0; neg t0, t0 -> 删除两条
+                if (op == "neg" && operands.size() == 2 && i + 1 < lines.size()) {
+                    auto [nextOp, nextOperands] = parseInstruction(lines[i + 1]);
+                    if (nextOp == "neg" && nextOperands.size() == 2 &&
+                        nextOperands[0] == operands[0] && nextOperands[1] == operands[1] &&
+                        operands[0] == operands[1] && nextOperands[0] == nextOperands[1]) {
+                        i++;  // 跳过下一条
+                        changed = true;
+                        continue;
+                    }
+                }
+
+                newLines.push_back(lines[i]);
+            }
+
+            lines = move(newLines);
+        }
+
+        // 重新组装代码
+        ostringstream result;
+        for (const auto& l : lines) {
+            result << l << "\n";
+        }
+        return result.str();
+    }
+
 public:
     string generate(Program* prog) {
         out << ".text\n\n";
         for (auto& func : prog->functions) {
             genFunc(func.get());
         }
-        return out.str();
+        return peepholeOptimize(out.str());
     }
 };
 
