@@ -3317,24 +3317,67 @@ private:
     }
 
     // 统计表达式中变量的使用次数
-    void countVarUseInExpr(Expr* expr) {
+    int loopBaseWeight(int loopDepth) const {
+        if (loopDepth <= 0) return 1;
+        int d = min(loopDepth, 4);
+        return 1 << (d + 1);  // 4/8/16/32
+    }
+
+    void collectModifiedVarsInStmtGen(Stmt* stmt, set<string>& modified) {
+        if (!stmt) return;
+        switch (stmt->kind) {
+        case StmtKind::BLOCK: {
+            auto* block = static_cast<BlockStmt*>(stmt);
+            for (auto& s : block->stmts) collectModifiedVarsInStmtGen(s.get(), modified);
+            break;
+        }
+        case StmtKind::VARDECL:
+            modified.insert(static_cast<VarDeclStmt*>(stmt)->name);
+            break;
+        case StmtKind::ASSIGN:
+            modified.insert(static_cast<AssignStmt*>(stmt)->name);
+            break;
+        case StmtKind::IF: {
+            auto* i = static_cast<IfStmt*>(stmt);
+            collectModifiedVarsInStmtGen(i->thenStmt.get(), modified);
+            if (i->elseStmt) collectModifiedVarsInStmtGen(i->elseStmt.get(), modified);
+            break;
+        }
+        case StmtKind::WHILE:
+            collectModifiedVarsInStmtGen(static_cast<WhileStmt*>(stmt)->body.get(), modified);
+            break;
+        default:
+            break;
+        }
+    }
+
+    void countVarUseInExprWeighted(Expr* expr, int baseWeight, const set<string>* modifiedInLoop) {
         if (!expr) return;
         switch (expr->kind) {
-        case ExprKind::IDENT:
-            varUseFreq[static_cast<IdentExpr*>(expr)->name]++;
+        case ExprKind::IDENT: {
+            const string& name = static_cast<IdentExpr*>(expr)->name;
+            int w = baseWeight;
+            if (modifiedInLoop && modifiedInLoop->find(name) == modifiedInLoop->end()) {
+                // 循环不变量：额外加权，优先分配到寄存器（减少每次迭代的 lw）
+                w *= 4;
+            }
+            varUseFreq[name] += w;
             break;
+        }
         case ExprKind::UNARY:
-            countVarUseInExpr(static_cast<UnaryExpr*>(expr)->operand.get());
+            countVarUseInExprWeighted(static_cast<UnaryExpr*>(expr)->operand.get(), baseWeight, modifiedInLoop);
             break;
         case ExprKind::BINARY: {
             auto* b = static_cast<BinaryExpr*>(expr);
-            countVarUseInExpr(b->left.get());
-            countVarUseInExpr(b->right.get());
+            countVarUseInExprWeighted(b->left.get(), baseWeight, modifiedInLoop);
+            countVarUseInExprWeighted(b->right.get(), baseWeight, modifiedInLoop);
             break;
         }
         case ExprKind::CALL: {
             auto* c = static_cast<CallExpr*>(expr);
-            for (auto& arg : c->args) countVarUseInExpr(arg.get());
+            for (auto& arg : c->args) {
+                countVarUseInExprWeighted(arg.get(), baseWeight, modifiedInLoop);
+            }
             break;
         }
         default:
@@ -3342,47 +3385,54 @@ private:
         }
     }
 
-    // 统计语句中变量的使用次数
-    void countVarUseInStmtGen(Stmt* stmt) {
+    // 统计语句中变量的使用次数（用于寄存器分配），并对循环/循环不变量加权
+    void countVarUseInStmtGen(Stmt* stmt, int loopDepth = 0, const set<string>* modifiedInLoop = nullptr) {
+        if (!stmt) return;
+        int w = loopBaseWeight(loopDepth);
+
         switch (stmt->kind) {
         case StmtKind::BLOCK: {
             auto* block = static_cast<BlockStmt*>(stmt);
-            for (auto& s : block->stmts) countVarUseInStmtGen(s.get());
+            for (auto& s : block->stmts) countVarUseInStmtGen(s.get(), loopDepth, modifiedInLoop);
             break;
         }
         case StmtKind::VARDECL: {
             auto* v = static_cast<VarDeclStmt*>(stmt);
-            countVarUseInExpr(v->init.get());
-            varUseFreq[v->name]++;  // 声明也算一次使用
+            countVarUseInExprWeighted(v->init.get(), w, modifiedInLoop);
+            varUseFreq[v->name] += w;
             break;
         }
         case StmtKind::ASSIGN: {
             auto* a = static_cast<AssignStmt*>(stmt);
-            countVarUseInExpr(a->value.get());
-            varUseFreq[a->name]++;  // 赋值目标也算一次使用
+            countVarUseInExprWeighted(a->value.get(), w, modifiedInLoop);
+            varUseFreq[a->name] += w;
             break;
         }
         case StmtKind::IF: {
             auto* i = static_cast<IfStmt*>(stmt);
-            countVarUseInExpr(i->cond.get());
-            countVarUseInStmtGen(i->thenStmt.get());
-            if (i->elseStmt) countVarUseInStmtGen(i->elseStmt.get());
+            countVarUseInExprWeighted(i->cond.get(), w, modifiedInLoop);
+            countVarUseInStmtGen(i->thenStmt.get(), loopDepth, modifiedInLoop);
+            if (i->elseStmt) countVarUseInStmtGen(i->elseStmt.get(), loopDepth, modifiedInLoop);
             break;
         }
         case StmtKind::WHILE: {
-            auto* w = static_cast<WhileStmt*>(stmt);
-            // 循环内的变量使用权重更高
-            countVarUseInExpr(w->cond.get());
-            countVarUseInStmtGen(w->body.get());
+            auto* whileStmt = static_cast<WhileStmt*>(stmt);
+            set<string> modified;
+            collectModifiedVarsInStmtGen(whileStmt->body.get(), modified);
+
+            int innerDepth = loopDepth + 1;
+            int innerWeight = loopBaseWeight(innerDepth);
+            countVarUseInExprWeighted(whileStmt->cond.get(), innerWeight, &modified);
+            countVarUseInStmtGen(whileStmt->body.get(), innerDepth, &modified);
             break;
         }
         case StmtKind::RETURN: {
             auto* r = static_cast<ReturnStmt*>(stmt);
-            if (r->value) countVarUseInExpr(r->value.get());
+            if (r->value) countVarUseInExprWeighted(r->value.get(), w, modifiedInLoop);
             break;
         }
         case StmtKind::EXPR:
-            countVarUseInExpr(static_cast<ExprStmt*>(stmt)->expr.get());
+            countVarUseInExprWeighted(static_cast<ExprStmt*>(stmt)->expr.get(), w, modifiedInLoop);
             break;
         default:
             break;
@@ -3755,13 +3805,22 @@ private:
     void buildInterferenceGraph(FuncDef* func) {
         interferenceGraph.clear();
 
-        // 收集所有局部变量
+        // 收集所有局部变量 + 参数（用于参数寄存器化）
         set<string> allVars;
         collectVariables(func->body.get(), allVars);
 
-        // 排除参数
         for (const auto& param : func->params) {
-            allVars.erase(param->name);
+            if (param) allVars.insert(param->name);
+        }
+
+        // 只为“实际出现过”的变量建图，避免给未使用的参数/变量分配寄存器
+        for (auto it = allVars.begin(); it != allVars.end(); ) {
+            auto costIt = varUseFreq.find(*it);
+            if (costIt == varUseFreq.end() || costIt->second <= 0) {
+                it = allVars.erase(it);
+            } else {
+                ++it;
+            }
         }
 
         interferenceGraph.nodes = allVars;
@@ -3770,6 +3829,20 @@ private:
         for (const string& var : allVars) {
             interferenceGraph.edges[var] = {};
             interferenceGraph.spillCost[var] = varUseFreq[var];
+        }
+
+        // 对每个基本块入口的活跃变量两两加边，补足“无显式定义时”的干涉关系（尤其是参数之间）
+        for (const auto& block : currentCFG.blocks) {
+            vector<string> liveInVars;
+            liveInVars.reserve(block.liveIn.size());
+            for (const auto& v : block.liveIn) {
+                if (allVars.count(v)) liveInVars.push_back(v);
+            }
+            for (size_t i = 0; i < liveInVars.size(); i++) {
+                for (size_t j = i + 1; j < liveInVars.size(); j++) {
+                    interferenceGraph.addEdge(liveInVars[i], liveInVars[j]);
+                }
+            }
         }
 
         // 遍历每个基本块，细粒度计算干涉
@@ -3991,7 +4064,7 @@ private:
                 int regIdx = 0;
                 for (auto& [varName, freq] : sortedVars) {
                     if (regIdx >= 6) break;
-                    if (paramIndex.find(varName) == paramIndex.end() && freq >= 3) {
+                    if (freq >= 3) {
                         varToReg[varName] = sRegs[regIdx];
                         usedSRegs.push_back(sRegs[regIdx]);
                         regIdx++;
@@ -4173,6 +4246,7 @@ private:
     }
 
     int paramSlotOffset(int paramIdx) const {
+        // 所有参数统一保存到本函数栈帧（a0-a7 直接保存，a8+ 从调用者出参区拷贝进来）
         int sRegSaveCount = (int)usedSRegs.size();
         int paramStartOffset = -8 - sRegSaveCount * 4;
         return paramStartOffset - 4 - paramIdx * 4;
@@ -4634,16 +4708,26 @@ private:
             emit("sw t0, " + to_string(i * 4) + "(sp)");
         }
 
-        // 2. 将临时空间的值复制到参数寄存器位置
-        // 参数在栈上的位置: s0 - 8 - sRegsCount*4 - 4 - i*4
-        int sRegSaveCount = usedSRegs.size();
-        int paramStartOffset = -8 - sRegSaveCount * 4;
+        // 2. 更新参数槽位 +（如已寄存器化）同步参数寄存器
+        for (int i = 0; i < argCount; i++) {
+            const string& paramName = (i < (int)currentParamNames.size()) ? currentParamNames[i] : string();
 
-        for (int i = 0; i < argCount && i < 8; i++) {
-            // 从临时空间加载到 a 寄存器
-            emit("lw a" + to_string(i) + ", " + to_string(i * 4) + "(sp)");
-            // 同时存储到参数在栈上的位置
-            emit("sw a" + to_string(i) + ", " + to_string(paramStartOffset - 4 - i * 4) + "(s0)");
+            if (i < 8) {
+                // 从临时空间加载到 a 寄存器
+                emit("lw a" + to_string(i) + ", " + to_string(i * 4) + "(sp)");
+                // 写回到本函数的参数槽位
+                emit("sw a" + to_string(i) + ", " + to_string(paramSlotOffset(i)) + "(s0)");
+                // 同步寄存器化参数
+                if (!paramName.empty() && g_optimize && varToReg.count(paramName)) {
+                    emit("mv " + varToReg[paramName] + ", a" + to_string(i));
+                }
+            } else {
+                emit("lw t0, " + to_string(i * 4) + "(sp)");
+                emit("sw t0, " + to_string(paramSlotOffset(i)) + "(s0)");
+                if (!paramName.empty() && g_optimize && varToReg.count(paramName)) {
+                    emit("mv " + varToReg[paramName] + ", t0");
+                }
+            }
         }
 
         // 3. 回收临时栈空间
@@ -4815,6 +4899,8 @@ private:
         // 设置尾调用优化信息
         currentFuncName = func->name;
         currentParamCount = func->params.size();
+        currentParamNames.clear();
+        for (auto& p : func->params) currentParamNames.push_back(p->name);
         funcEntryLabel = "__tail_entry_" + func->name;
 
         // 计算需要的栈空间
@@ -4834,10 +4920,9 @@ private:
         // 计算需要保存的 callee-saved 寄存器数量
         int sRegSaveCount = usedSRegs.size();
 
-        // ra + s0 + callee-saved寄存器 + 参数存储 + 局部变量
-        // 叶函数可以不保存 ra
-        int raSpace = (g_optimize && currentFuncIsLeaf) ? 0 : 4;
-        int neededSpace = raSpace + 4 + sRegSaveCount * 4 + paramCount * 4 + localVarCount * 4;
+        // 栈帧：固定保留 ra 槽位 + s0 槽位（8B），再加上 sRegs/参数/局部变量
+        // 即使是叶函数不保存 ra，也保留 ra 槽位以保持统一布局，避免参数槽越界。
+        int neededSpace = 8 + sRegSaveCount * 4 + paramCount * 4 + localVarCount * 4;
         frameSize = ((neededSpace + 15) / 16) * 16;
 
         // 函数标签
@@ -4867,6 +4952,28 @@ private:
         int paramStartOffset = -8 - sRegSaveCount * 4;
         for (int i = 0; i < paramCount && i < 8; i++) {
             emit("sw a" + to_string(i) + ", " + to_string(paramStartOffset - 4 - i * 4) + "(s0)");
+        }
+
+        // 将 a8+ 参数从调用者的出参区拷贝到本函数栈帧，统一使用 paramSlotOffset 访问
+        for (int i = 8; i < paramCount; i++) {
+            emit("lw t0, " + to_string((i - 8) * 4) + "(s0)");
+            emit("sw t0, " + to_string(paramSlotOffset(i)) + "(s0)");
+        }
+
+        // 参数寄存器化：将参数装载到分配到的 callee-saved 寄存器
+        // 这样循环条件/循环不变量等频繁读取时可避免反复 lw
+        if (g_optimize) {
+            for (int i = 0; i < paramCount; i++) {
+                const string& pName = func->params[i]->name;
+                auto it = varToReg.find(pName);
+                if (it == varToReg.end()) continue;
+                const string& reg = it->second;
+                if (i < 8) {
+                    emit("mv " + reg + ", a" + to_string(i));
+                } else {
+                    emit("lw " + reg + ", " + to_string(paramSlotOffset(i)) + "(s0)");
+                }
+            }
         }
 
         // 设置局部变量起始偏移（跳过 ra、s0、sRegs 和参数）
