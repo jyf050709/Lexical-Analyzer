@@ -2798,10 +2798,10 @@ public:
             cseStmtList(func->body->stmts);
         }
 
-        // 第五阶段：尾递归优化
-        for (auto& func : prog->functions) {
-            optimizeTailRecursion(func.get());
-        }
+        // 第五阶段：尾递归优化（暂时禁用 - 需要处理if分支内的尾递归）
+        // for (auto& func : prog->functions) {
+        //     optimizeTailRecursion(func.get());
+        // }
 
         // 第六阶段：死变量消除
         for (int round = 0; round < 3; round++) {
@@ -3334,6 +3334,9 @@ private:
     void buildCFG(FuncDef* func) {
         currentCFG = CFG();
         currentCFG.entryBlockId = 0;
+
+        // 预分配足够空间，避免vector重新分配导致引用失效
+        currentCFG.blocks.reserve(128);
 
         // 创建入口块
         currentCFG.blocks.push_back(BasicBlock{0, {}, {}, {}, {}, {}, {}, {}});

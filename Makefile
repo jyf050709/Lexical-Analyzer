@@ -1,5 +1,5 @@
 CXX = g++
-CXXFLAGS = -std=c++17 -Wall -O0
+CXXFLAGS = -std=c++17 -Wall -O2
 TARGET = compiler
 
 all: $(TARGET)
