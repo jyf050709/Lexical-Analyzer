@@ -2782,10 +2782,10 @@ public:
             cseStmtList(func->body->stmts);
         }
 
-        // 第五阶段：尾递归优化
-        for (auto& func : prog->functions) {
-            optimizeTailRecursion(func.get());
-        }
+        // 第五阶段：尾递归优化（暂时禁用以调试段错误）
+        // for (auto& func : prog->functions) {
+        //     optimizeTailRecursion(func.get());
+        // }
 
         // 第六阶段：死变量消除
         for (int round = 0; round < 3; round++) {
@@ -3000,9 +3000,7 @@ private:
             auto* w = static_cast<WhileStmt*>(stmt);
             // 循环内的变量使用权重更高
             countVarUseInExpr(w->cond.get());
-            varUseFreq[static_cast<IdentExpr*>(w->cond.get())->name] += 10;  // 条件变量权重增加
             countVarUseInStmtGen(w->body.get());
-            // 循环体内所有变量权重翻倍
             break;
         }
         case StmtKind::RETURN: {
@@ -3131,8 +3129,11 @@ private:
             int paramIdx;
             int offset = lookupVar(ident->name, paramIdx);
             if (paramIdx >= 0) {
+                // 参数偏移需要考虑 sRegs
+                int sRegSaveCount = usedSRegs.size();
+                int paramStartOffset = -8 - sRegSaveCount * 4;
                 if (paramIdx < 8) {
-                    emit("lw " + targetReg + ", " + to_string(-12 - paramIdx * 4) + "(s0)");
+                    emit("lw " + targetReg + ", " + to_string(paramStartOffset - 4 - paramIdx * 4) + "(s0)");
                 } else {
                     emit("lw " + targetReg + ", " + to_string((paramIdx - 8) * 4) + "(s0)");
                 }
@@ -3171,8 +3172,11 @@ private:
             int paramIdx;
             int offset = lookupVar(ident->name, paramIdx);
             if (paramIdx >= 0) {
+                // 参数偏移需要考虑 sRegs
+                int sRegSaveCount = usedSRegs.size();
+                int paramStartOffset = -8 - sRegSaveCount * 4;
                 if (paramIdx < 8) {
-                    emit("lw t0, " + to_string(-12 - paramIdx * 4) + "(s0)");
+                    emit("lw t0, " + to_string(paramStartOffset - 4 - paramIdx * 4) + "(s0)");
                 } else {
                     emit("lw t0, " + to_string((paramIdx - 8) * 4) + "(s0)");
                 }
@@ -3532,18 +3536,33 @@ private:
         case StmtKind::VARDECL: {
             auto* varDecl = static_cast<VarDeclStmt*>(stmt);
             genExpr(varDecl->init.get());
-            int offset = allocVar(varDecl->name);
-            emit("sw t0, " + to_string(offset) + "(s0)");
+            // 检查是否分配了寄存器
+            if (g_optimize && varToReg.count(varDecl->name)) {
+                emit("mv " + varToReg[varDecl->name] + ", t0");
+                // 仍然分配栈空间（用于调试和一致性）
+                allocVar(varDecl->name);
+            } else {
+                int offset = allocVar(varDecl->name);
+                emit("sw t0, " + to_string(offset) + "(s0)");
+            }
             break;
         }
         case StmtKind::ASSIGN: {
             auto* assign = static_cast<AssignStmt*>(stmt);
             genExpr(assign->value.get());
+            // 检查是否分配了寄存器
+            if (g_optimize && varToReg.count(assign->name)) {
+                emit("mv " + varToReg[assign->name] + ", t0");
+                break;
+            }
             int paramIdx;
             int offset = lookupVar(assign->name, paramIdx);
             if (paramIdx >= 0) {
+                // 参数偏移需要考虑 sRegs
+                int sRegSaveCount = usedSRegs.size();
+                int paramStartOffset = -8 - sRegSaveCount * 4;
                 if (paramIdx < 8) {
-                    emit("sw t0, " + to_string(-12 - paramIdx * 4) + "(s0)");
+                    emit("sw t0, " + to_string(paramStartOffset - 4 - paramIdx * 4) + "(s0)");
                 } else {
                     emit("sw t0, " + to_string((paramIdx - 8) * 4) + "(s0)");
                 }
@@ -3595,7 +3614,16 @@ private:
                 genExpr(ret->value.get());
                 emit("mv a0, t0");
             }
-            emit("lw ra, " + to_string(frameSize - 4) + "(sp)");
+            // 恢复 callee-saved 寄存器
+            int sRegOffset = frameSize - 12;
+            for (const auto& reg : usedSRegs) {
+                emit("lw " + reg + ", " + to_string(sRegOffset) + "(sp)");
+                sRegOffset -= 4;
+            }
+            // 叶函数优化：不恢复 ra
+            if (!g_optimize || !currentFuncIsLeaf) {
+                emit("lw ra, " + to_string(frameSize - 4) + "(sp)");
+            }
             emit("lw s0, " + to_string(frameSize - 8) + "(sp)");
             emit("addi sp, sp, " + to_string(frameSize));
             emit("ret");
@@ -3643,39 +3671,62 @@ private:
         paramIndex.clear();
         varScopes.clear();
         varScopes.push_back({});  // 函数作用域
+        spDeltaBytes = 0;
 
         // 计算需要的栈空间
         int paramCount = func->params.size();
         int localVarCount = countLocalVars(func->body.get());
 
-        // ra + s0 + 参数存储 + 局部变量 + 临时空间
-        int neededSpace = 8 + paramCount * 4 + localVarCount * 4 + 128;
-        frameSize = ((neededSpace + 15) / 16) * 16;
-
-        // 设置参数索引
+        // 设置参数索引（在 analyzeFunction 之前设置）
         for (int i = 0; i < paramCount; i++) {
             paramIndex[func->params[i]->name] = i;
         }
 
+        // 优化：分析函数特性
+        if (g_optimize) {
+            analyzeFunction(func);
+        }
+
+        // 计算需要保存的 callee-saved 寄存器数量
+        int sRegSaveCount = usedSRegs.size();
+
+        // ra + s0 + callee-saved寄存器 + 参数存储 + 局部变量 + 临时空间
+        // 叶函数可以不保存 ra
+        int raSpace = (g_optimize && currentFuncIsLeaf) ? 0 : 4;
+        int neededSpace = raSpace + 4 + sRegSaveCount * 4 + paramCount * 4 + localVarCount * 4 + 128;
+        frameSize = ((neededSpace + 15) / 16) * 16;
+
         // 函数标签
         out << ".globl " << func->name << "\n";
         emitLabel(func->name);
-        emitLabel("prologue_" + func->name);
 
         // 序言
         emit("addi sp, sp, -" + to_string(frameSize));
-        emit("sw ra, " + to_string(frameSize - 4) + "(sp)");
-        emit("sw s0, " + to_string(frameSize - 8) + "(sp)");
-        emit("addi s0, sp, " + to_string(frameSize));
 
-        // 保存参数（在 ra 和 s0 之后，从 s0-12 开始）
-        // 栈布局: s0-4=ra, s0-8=s0, s0-12=param0, s0-16=param1, ...
-        for (int i = 0; i < paramCount && i < 8; i++) {
-            emit("sw a" + to_string(i) + ", " + to_string(-12 - i * 4) + "(s0)");
+        // 叶函数优化：不保存 ra
+        if (!g_optimize || !currentFuncIsLeaf) {
+            emit("sw ra, " + to_string(frameSize - 4) + "(sp)");
+        }
+        emit("sw s0, " + to_string(frameSize - 8) + "(sp)");
+
+        // 保存使用的 callee-saved 寄存器 (s1-s6)
+        int sRegOffset = frameSize - 12;
+        for (const auto& reg : usedSRegs) {
+            emit("sw " + reg + ", " + to_string(sRegOffset) + "(sp)");
+            sRegOffset -= 4;
         }
 
-        // 设置局部变量起始偏移（跳过 ra、s0 和参数）
-        stackOffset = -8 - paramCount * 4;
+        emit("addi s0, sp, " + to_string(frameSize));
+
+        // 保存参数（在 s0 之后，从 s0-12-sRegSaveCount*4 开始）
+        // 栈布局: s0-4=ra(可选), s0-8=s0, s0-12...=sRegs, 然后是参数
+        int paramStartOffset = -8 - sRegSaveCount * 4;
+        for (int i = 0; i < paramCount && i < 8; i++) {
+            emit("sw a" + to_string(i) + ", " + to_string(paramStartOffset - 4 - i * 4) + "(s0)");
+        }
+
+        // 设置局部变量起始偏移（跳过 ra、s0、sRegs 和参数）
+        stackOffset = paramStartOffset - 4 - paramCount * 4;
 
         // 生成函数体
         for (auto& stmt : func->body->stmts) {
@@ -3684,7 +3735,16 @@ private:
 
         // void 函数可自然结束，补一个返回
         if (func->isVoid) {
-            emit("lw ra, " + to_string(frameSize - 4) + "(sp)");
+            // 恢复 callee-saved 寄存器
+            sRegOffset = frameSize - 12;
+            for (const auto& reg : usedSRegs) {
+                emit("lw " + reg + ", " + to_string(sRegOffset) + "(sp)");
+                sRegOffset -= 4;
+            }
+
+            if (!g_optimize || !currentFuncIsLeaf) {
+                emit("lw ra, " + to_string(frameSize - 4) + "(sp)");
+            }
             emit("lw s0, " + to_string(frameSize - 8) + "(sp)");
             emit("addi sp, sp, " + to_string(frameSize));
             emit("ret");
@@ -3855,6 +3915,109 @@ private:
                         continue;
                     }
                 }
+
+                // 模式11: seqz t0, t0; seqz t0, t0 -> 删除两条（双重取反）
+                if (op == "seqz" && operands.size() == 2 && operands[0] == operands[1] && i + 1 < lines.size()) {
+                    auto [nextOp, nextOperands] = parseInstruction(lines[i + 1]);
+                    if (nextOp == "seqz" && nextOperands.size() == 2 &&
+                        nextOperands[0] == operands[0] && nextOperands[1] == operands[1]) {
+                        i++;  // 跳过下一条
+                        changed = true;
+                        continue;
+                    }
+                }
+
+                // 模式12: 合并相邻的 addi sp, sp, X 和 addi sp, sp, Y
+                if (op == "addi" && operands.size() == 3 && operands[0] == "sp" &&
+                    operands[1] == "sp" && i + 1 < lines.size()) {
+                    auto [nextOp, nextOperands] = parseInstruction(lines[i + 1]);
+                    if (nextOp == "addi" && nextOperands.size() == 3 &&
+                        nextOperands[0] == "sp" && nextOperands[1] == "sp") {
+                        try {
+                            int offset1 = stoi(operands[2]);
+                            int offset2 = stoi(nextOperands[2]);
+                            int combined = offset1 + offset2;
+                            if (combined != 0) {
+                                newLines.push_back("\taddi sp, sp, " + to_string(combined));
+                            }
+                            i++;  // 跳过下一条
+                            changed = true;
+                            continue;
+                        } catch (...) {}
+                    }
+                }
+
+                // 模式13: li t0, 1; mul t0, t1, t0 -> mv t0, t1
+                if (op == "li" && operands.size() == 2 && operands[1] == "1" && i + 1 < lines.size()) {
+                    auto [nextOp, nextOperands] = parseInstruction(lines[i + 1]);
+                    if (nextOp == "mul" && nextOperands.size() == 3 &&
+                        nextOperands[0] == operands[0] && nextOperands[2] == operands[0]) {
+                        newLines.push_back("\tmv " + nextOperands[0] + ", " + nextOperands[1]);
+                        i++;
+                        changed = true;
+                        continue;
+                    }
+                    if (nextOp == "mul" && nextOperands.size() == 3 &&
+                        nextOperands[0] == operands[0] && nextOperands[1] == operands[0]) {
+                        newLines.push_back("\tmv " + nextOperands[0] + ", " + nextOperands[2]);
+                        i++;
+                        changed = true;
+                        continue;
+                    }
+                }
+
+                // 模式14: xori t0, t0, 1; xori t0, t0, 1 -> 删除两条
+                if (op == "xori" && operands.size() == 3 && operands[0] == operands[1] &&
+                    operands[2] == "1" && i + 1 < lines.size()) {
+                    auto [nextOp, nextOperands] = parseInstruction(lines[i + 1]);
+                    if (nextOp == "xori" && nextOperands.size() == 3 &&
+                        nextOperands[0] == operands[0] && nextOperands[1] == operands[1] &&
+                        nextOperands[2] == "1") {
+                        i++;  // 跳过下一条
+                        changed = true;
+                        continue;
+                    }
+                }
+
+                // 模式15: mv t0, t1; mv t1, t0 后只用 t0 -> 删除第二条
+                if (op == "mv" && operands.size() == 2 && i + 1 < lines.size()) {
+                    auto [nextOp, nextOperands] = parseInstruction(lines[i + 1]);
+                    if (nextOp == "mv" && nextOperands.size() == 2 &&
+                        nextOperands[0] == operands[1] && nextOperands[1] == operands[0]) {
+                        newLines.push_back(lines[i]);
+                        i++;  // 跳过下一条
+                        changed = true;
+                        continue;
+                    }
+                }
+
+                // 模式16: li t0, 0; sub t0, t1, t0 -> mv t0, t1
+                if (op == "li" && operands.size() == 2 && operands[1] == "0" && i + 1 < lines.size()) {
+                    auto [nextOp, nextOperands] = parseInstruction(lines[i + 1]);
+                    if (nextOp == "sub" && nextOperands.size() == 3 &&
+                        nextOperands[0] == operands[0] && nextOperands[2] == operands[0]) {
+                        newLines.push_back("\tmv " + nextOperands[0] + ", " + nextOperands[1]);
+                        i++;
+                        changed = true;
+                        continue;
+                    }
+                }
+
+                // 模式17: srli t0, t0, 0 -> 删除
+                if (op == "srli" && operands.size() == 3 && operands[2] == "0") {
+                    changed = true;
+                    continue;
+                }
+
+                // 模式18: and/or/xor t0, t0, t0 -> 无效操作
+                if ((op == "and" || op == "or") && operands.size() == 3 &&
+                    operands[0] == operands[1] && operands[1] == operands[2]) {
+                    changed = true;
+                    continue;
+                }
+
+                // 模式19: beqz t0, L; j L2; L: -> beqz 可能可以优化
+                // （这个模式较复杂，暂时跳过）
 
                 newLines.push_back(lines[i]);
             }

@@ -16,7 +16,8 @@
       "Bash(dir /s /b \"c:\\\\Users\\\\Administrator\\\\Desktop\\\\词法分析器\\\\*.c\")",
       "Bash(dir:*)",
       "Bash(\"c:\\\\Users\\\\Administrator\\\\Desktop\\\\词法分析器\\\\compiler.exe\")",
-      "Bash(./compiler.exe:*)"
+      "Bash(./compiler.exe:*)",
+      "Bash(del compiler.exe)"
     ],
     "deny": [],
     "ask": []

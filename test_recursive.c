@@ -1,0 +1,12 @@
+// 递归函数测试（无法内联）
+int factorial(int n) {
+    if (n <= 1) {
+        return 1;
+    }
+    return n * factorial(n - 1);
+}
+
+int main() {
+    int x = factorial(5);
+    return x;
+}
