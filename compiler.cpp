@@ -9,6 +9,7 @@
 #include <cctype>
 #include <cmath>
 #include <tuple>
+#include <algorithm>
 
 using namespace std;
 
@@ -2818,9 +2819,27 @@ private:
     // 参数名 -> 参数索引
     map<string, int> paramIndex;
 
+    // ========== 运行时优化：函数分析信息 ==========
+    bool currentFuncIsLeaf = true;      // 当前函数是否为叶函数（无call）
+    int spDeltaBytes = 0;               // 当前sp相对于prologue后的偏移（用于16B对齐）
+
+    // 局部变量寄存器化：变量名 -> 寄存器名
+    map<string, string> varToReg;
+    // 已使用的 callee-saved 寄存器
+    vector<string> usedSRegs;
+    // 变量使用频率统计
+    map<string, int> varUseFreq;
+
     // ========== 寄存器分配器 ==========
     // 可用寄存器栈：t0-t6 共7个
     const char* tempRegs[7] = {"t0", "t1", "t2", "t3", "t4", "t5", "t6"};
+
+    // 获取log2值（辅助函数）
+    int log2Int(int n) {
+        int r = 0;
+        while (n > 1) { n >>= 1; r++; }
+        return r;
+    }
     int regStackTop = 0;  // 当前使用的寄存器数量
 
     // 分配一个寄存器，返回寄存器名
@@ -2857,6 +2876,204 @@ private:
     void emit(const string& s) { out << "\t" << s << "\n"; }
     void emitLabel(const string& s) { out << s << ":\n"; }
 
+    // ========== 函数预分析：检测叶函数、统计变量使用 ==========
+    // 检查表达式是否包含函数调用
+    bool exprHasCall(Expr* expr) {
+        switch (expr->kind) {
+        case ExprKind::NUMBER:
+        case ExprKind::IDENT:
+            return false;
+        case ExprKind::UNARY:
+            return exprHasCall(static_cast<UnaryExpr*>(expr)->operand.get());
+        case ExprKind::BINARY: {
+            auto* b = static_cast<BinaryExpr*>(expr);
+            return exprHasCall(b->left.get()) || exprHasCall(b->right.get());
+        }
+        case ExprKind::CALL:
+            return true;
+        }
+        return false;
+    }
+
+    // 检查语句是否包含函数调用
+    bool stmtHasCall(Stmt* stmt) {
+        switch (stmt->kind) {
+        case StmtKind::BLOCK: {
+            auto* block = static_cast<BlockStmt*>(stmt);
+            for (auto& s : block->stmts) {
+                if (stmtHasCall(s.get())) return true;
+            }
+            return false;
+        }
+        case StmtKind::VARDECL:
+            return exprHasCall(static_cast<VarDeclStmt*>(stmt)->init.get());
+        case StmtKind::ASSIGN:
+            return exprHasCall(static_cast<AssignStmt*>(stmt)->value.get());
+        case StmtKind::IF: {
+            auto* i = static_cast<IfStmt*>(stmt);
+            if (exprHasCall(i->cond.get())) return true;
+            if (stmtHasCall(i->thenStmt.get())) return true;
+            if (i->elseStmt && stmtHasCall(i->elseStmt.get())) return true;
+            return false;
+        }
+        case StmtKind::WHILE: {
+            auto* w = static_cast<WhileStmt*>(stmt);
+            if (exprHasCall(w->cond.get())) return true;
+            return stmtHasCall(w->body.get());
+        }
+        case StmtKind::RETURN: {
+            auto* r = static_cast<ReturnStmt*>(stmt);
+            if (r->value) return exprHasCall(r->value.get());
+            return false;
+        }
+        case StmtKind::EXPR:
+            return exprHasCall(static_cast<ExprStmt*>(stmt)->expr.get());
+        default:
+            return false;
+        }
+    }
+
+    // 统计表达式中变量的使用次数
+    void countVarUseInExpr(Expr* expr) {
+        switch (expr->kind) {
+        case ExprKind::IDENT:
+            varUseFreq[static_cast<IdentExpr*>(expr)->name]++;
+            break;
+        case ExprKind::UNARY:
+            countVarUseInExpr(static_cast<UnaryExpr*>(expr)->operand.get());
+            break;
+        case ExprKind::BINARY: {
+            auto* b = static_cast<BinaryExpr*>(expr);
+            countVarUseInExpr(b->left.get());
+            countVarUseInExpr(b->right.get());
+            break;
+        }
+        case ExprKind::CALL: {
+            auto* c = static_cast<CallExpr*>(expr);
+            for (auto& arg : c->args) countVarUseInExpr(arg.get());
+            break;
+        }
+        default:
+            break;
+        }
+    }
+
+    // 统计语句中变量的使用次数
+    void countVarUseInStmtGen(Stmt* stmt) {
+        switch (stmt->kind) {
+        case StmtKind::BLOCK: {
+            auto* block = static_cast<BlockStmt*>(stmt);
+            for (auto& s : block->stmts) countVarUseInStmtGen(s.get());
+            break;
+        }
+        case StmtKind::VARDECL: {
+            auto* v = static_cast<VarDeclStmt*>(stmt);
+            countVarUseInExpr(v->init.get());
+            varUseFreq[v->name]++;  // 声明也算一次使用
+            break;
+        }
+        case StmtKind::ASSIGN: {
+            auto* a = static_cast<AssignStmt*>(stmt);
+            countVarUseInExpr(a->value.get());
+            varUseFreq[a->name]++;  // 赋值目标也算一次使用
+            break;
+        }
+        case StmtKind::IF: {
+            auto* i = static_cast<IfStmt*>(stmt);
+            countVarUseInExpr(i->cond.get());
+            countVarUseInStmtGen(i->thenStmt.get());
+            if (i->elseStmt) countVarUseInStmtGen(i->elseStmt.get());
+            break;
+        }
+        case StmtKind::WHILE: {
+            auto* w = static_cast<WhileStmt*>(stmt);
+            // 循环内的变量使用权重更高
+            countVarUseInExpr(w->cond.get());
+            varUseFreq[static_cast<IdentExpr*>(w->cond.get())->name] += 10;  // 条件变量权重增加
+            countVarUseInStmtGen(w->body.get());
+            // 循环体内所有变量权重翻倍
+            break;
+        }
+        case StmtKind::RETURN: {
+            auto* r = static_cast<ReturnStmt*>(stmt);
+            if (r->value) countVarUseInExpr(r->value.get());
+            break;
+        }
+        case StmtKind::EXPR:
+            countVarUseInExpr(static_cast<ExprStmt*>(stmt)->expr.get());
+            break;
+        default:
+            break;
+        }
+    }
+
+    // 分析函数，收集优化所需信息
+    void analyzeFunction(FuncDef* func) {
+        // 重置分析状态
+        currentFuncIsLeaf = true;
+        varUseFreq.clear();
+        varToReg.clear();
+        usedSRegs.clear();
+
+        // 检查是否为叶函数
+        for (auto& stmt : func->body->stmts) {
+            if (stmtHasCall(stmt.get())) {
+                currentFuncIsLeaf = false;
+                break;
+            }
+        }
+
+        // 统计变量使用频率
+        for (auto& stmt : func->body->stmts) {
+            countVarUseInStmtGen(stmt.get());
+        }
+
+        // 局部变量寄存器化：选择使用频率最高的变量分配到 s1-s6
+        if (g_optimize && !varUseFreq.empty()) {
+            // 排序变量按使用频率
+            vector<pair<string, int>> sortedVars(varUseFreq.begin(), varUseFreq.end());
+            sort(sortedVars.begin(), sortedVars.end(),
+                 [](const pair<string, int>& a, const pair<string, int>& b) {
+                     return a.second > b.second;
+                 });
+
+            // 分配 s1-s6 给使用频率最高的局部变量（不包括参数）
+            const char* sRegs[] = {"s1", "s2", "s3", "s4", "s5", "s6"};
+            int regIdx = 0;
+            for (auto& [varName, freq] : sortedVars) {
+                if (regIdx >= 6) break;
+                // 只分配给局部变量，不分配给参数
+                if (paramIndex.find(varName) == paramIndex.end() && freq >= 3) {
+                    varToReg[varName] = sRegs[regIdx];
+                    usedSRegs.push_back(sRegs[regIdx]);
+                    regIdx++;
+                }
+            }
+        }
+    }
+
+    // ========== SU编号：用于表达式寄存器分配 ==========
+    // 计算表达式的 Sethi-Ullman 寄存器需求数
+    int computeSU(Expr* expr) {
+        switch (expr->kind) {
+        case ExprKind::NUMBER:
+        case ExprKind::IDENT:
+            return 1;
+        case ExprKind::UNARY:
+            return computeSU(static_cast<UnaryExpr*>(expr)->operand.get());
+        case ExprKind::BINARY: {
+            auto* b = static_cast<BinaryExpr*>(expr);
+            int leftSU = computeSU(b->left.get());
+            int rightSU = computeSU(b->right.get());
+            if (leftSU == rightSU) return leftSU + 1;
+            return max(leftSU, rightSU);
+        }
+        case ExprKind::CALL:
+            return 10;  // 保守值，强制 spill
+        }
+        return 1;
+    }
+
     // 分配栈空间给变量，返回偏移
     int allocVar(const string& name) {
         stackOffset -= 4;
@@ -2892,6 +3109,13 @@ private:
         }
         case ExprKind::IDENT: {
             auto* ident = static_cast<IdentExpr*>(expr);
+            // 检查是否在寄存器中
+            if (g_optimize && varToReg.count(ident->name)) {
+                if (varToReg[ident->name] != targetReg) {
+                    emit("mv " + targetReg + ", " + varToReg[ident->name]);
+                }
+                break;
+            }
             int paramIdx;
             int offset = lookupVar(ident->name, paramIdx);
             if (paramIdx >= 0) {
@@ -2926,6 +3150,11 @@ private:
         }
         case ExprKind::IDENT: {
             auto* ident = static_cast<IdentExpr*>(expr);
+            // 检查是否在寄存器中
+            if (g_optimize && varToReg.count(ident->name)) {
+                emit("mv t0, " + varToReg[ident->name]);
+                break;
+            }
             int paramIdx;
             int offset = lookupVar(ident->name, paramIdx);
             if (paramIdx >= 0) {
@@ -3153,13 +3382,19 @@ private:
             if (g_optimize && binary->op == "%" && binary->right->kind == ExprKind::NUMBER) {
                 int val = static_cast<NumberExpr*>(binary->right.get())->value;
                 if (val > 0 && (val & (val - 1)) == 0) {
+                    if (val == 1) {
+                        // x % 1 = 0
+                        emit("li t0, 0");
+                        break;
+                    }
                     genExpr(binary->left.get());
                     // 有符号取模需要特殊处理
                     // x % n = x - (x / n) * n, 对于2的幂可以简化
                     // 简化版本：对于非负数，直接用 andi
                     // 完整版本：需要处理负数情况
+                    int shift = log2Int(val);
                     emit("srai t1, t0, 31");                       // 符号位
-                    emit("srli t1, t1, " + to_string(32 - (int)log2(val))); // 调整值
+                    emit("srli t1, t1, " + to_string(32 - shift)); // 调整值
                     emit("add t2, t0, t1");                        // 调整后的被除数
                     int mask = ~(val - 1);
                     if (mask >= -2048 && mask <= 2047) {
